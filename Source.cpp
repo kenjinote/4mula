@@ -18,6 +18,12 @@
 #include <iomanip>
 #include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/math/special_functions/gamma.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
+#include <boost/multiprecision/miller_rabin.hpp>
+#include <boost/random.hpp>
+#include <map>
+#include <ctime>
+#include "resource.h"
 using namespace boost::multiprecision;
 typedef boost::multiprecision::number<boost::multiprecision::cpp_dec_float<500>> BigFloat;
 using namespace Microsoft::WRL;
@@ -32,6 +38,7 @@ public:
     virtual void DrawGlyph(const std::wstring& text, float x, float y, float fontSize, bool isItalic) = 0;
     virtual void DrawLine(float x1, float y1, float x2, float y2, float thickness) = 0;
     virtual void FillCircle(float x, float y, float r) = 0;
+    virtual void FillPolygon(const std::vector<std::pair<float, float>>& vertices) = 0;
     virtual void MeasureGlyph(const std::wstring& text, float fontSize, bool isItalic, float& outWidth, float& outHeight, float& outDepth) = 0;
     virtual void SetTextColor(float r, float g, float b, float a = 1.0f) = 0;
 };
@@ -42,6 +49,7 @@ struct CaretMetrics {
     bool isActive = false;
 };
 std::vector<CaretMetrics> g_caretMetrics;
+extern int g_cursorPos;
 class Box {
 public:
     float width = 0.0f;
@@ -127,8 +135,17 @@ public:
     }
 };
 class HorizontalBox : public Box {
-    std::vector<std::shared_ptr<Box>> children;
 public:
+    std::vector<std::shared_ptr<Box>> children;
+    bool isParenGroup = false;
+    bool hideParens = false;
+    bool ShouldHide() const {
+        if (!hideParens) return false;
+        if (g_cursorPos >= srcStart && g_cursorPos <= srcEnd) {
+            return false;
+        }
+        return true;
+    }
     void Add(std::shared_ptr<Box> box) {
         children.push_back(box);
         width += box->width;
@@ -137,32 +154,41 @@ public:
     }
     void Draw(IMathRendererContext* context, float x, float y) const override {
         float currentX = x; float currentY = y + shift;
-        for (const auto& child : children) {
-            child->Draw(context, currentX, currentY); currentX += child->width;
+        bool doHide = ShouldHide();
+        for (size_t i = 0; i < children.size(); ++i) {
+            if (doHide && (i == 0 || i == children.size() - 1)) {
+            }
+            else {
+                children[i]->Draw(context, currentX, currentY);
+            }
+            currentX += children[i]->width;
         }
     }
     void SetFontSize(float newSize, IMathRendererContext* ctx) override {
         width = 0.0f; height = 0.0f; depth = 0.0f;
-        for (auto& child : children) {
-            child->SetFontSize(newSize, ctx);
-            width += child->width;
-            height = std::max(height, child->height - child->shift);
-            depth = std::max(depth, child->depth + child->shift);
+        bool doHide = ShouldHide();
+        for (size_t i = 0; i < children.size(); ++i) {
+            children[i]->SetFontSize(newSize, ctx);
+            if (doHide && (i == 0 || i == children.size() - 1)) {
+                children[i]->width = 0.0f;
+            }
+            width += children[i]->width;
+
+            if (!(doHide && (i == 0 || i == children.size() - 1))) {
+                height = std::max(height, children[i]->height - children[i]->shift);
+                depth = std::max(depth, children[i]->depth + children[i]->shift);
+            }
         }
     }
     void MapCaret(IMathRendererContext* ctx, float x, float y, float scale, bool isActive, std::vector<CaretMetrics>& metrics) const override {
         if (children.empty() && srcStart >= 0 && srcStart < metrics.size()) {
             if (metrics[srcStart].x < 0) {
-                metrics[srcStart].x = x;
-                metrics[srcStart].y = y + shift;
-                metrics[srcStart].scale = scale;
-                metrics[srcStart].isActive = isActive;
+                metrics[srcStart].x = x; metrics[srcStart].y = y + shift;
+                metrics[srcStart].scale = scale; metrics[srcStart].isActive = isActive;
             }
             if (srcEnd >= 0 && srcEnd < metrics.size() && metrics[srcEnd].x < 0) {
-                metrics[srcEnd].x = x;
-                metrics[srcEnd].y = y + shift;
-                metrics[srcEnd].scale = scale;
-                metrics[srcEnd].isActive = isActive;
+                metrics[srcEnd].x = x; metrics[srcEnd].y = y + shift;
+                metrics[srcEnd].scale = scale; metrics[srcEnd].isActive = isActive;
             }
         }
         float currentX = x;
@@ -309,26 +335,43 @@ public:
 };
 class RootBox : public Box {
     std::shared_ptr<Box> innerBox;
+    float fontSize = 36.0f;
     float padLeft = 14.0f; float padTop = 3.0f; float padRight = 2.0f;
     float actualOpeningHeight = 0.0f; float actualOpeningDepth = 0.0f;
 public:
     RootBox(std::shared_ptr<Box> inner) : innerBox(inner) { UpdateMetrics(36.0f); }
-    void UpdateMetrics(float fontSize) {
-        padLeft = fontSize * (14.0f / 36.0f); padTop = fontSize * (3.0f / 36.0f); padRight = fontSize * (2.0f / 36.0f);
+    void UpdateMetrics(float newFontSize) {
+        fontSize = newFontSize;
+        padLeft = fontSize * (16.0f / 36.0f);
+        padTop = fontSize * (3.0f / 36.0f); padRight = fontSize * (2.0f / 36.0f);
         float minInternalHeight = fontSize * (26.0f / 36.0f); float minInternalDepth = fontSize * (8.0f / 36.0f);
         actualOpeningHeight = std::max(innerBox->height, minInternalHeight); actualOpeningDepth = std::max(innerBox->depth, minInternalDepth);
-        width = padLeft + innerBox->width + padRight; height = actualOpeningHeight + padTop; depth = actualOpeningDepth + 2.0f;
+        width = padLeft + innerBox->width + padRight; height = actualOpeningHeight + padTop;
+        depth = actualOpeningDepth + fontSize * (2.0f / 36.0f);
     }
     void Draw(IMathRendererContext* context, float x, float y) const override {
         float currentY = y + shift; innerBox->Draw(context, x + padLeft, currentY);
-        float p1x = x; float p1y = currentY - actualOpeningHeight * 0.3f;
-        float p2x = x + padLeft * 0.45f; float p2y = currentY + actualOpeningDepth + 2.0f;
-        float p3x = x + padLeft - 2.0f; float p3y = currentY - actualOpeningHeight - padTop + 1.0f;
-        float p4x = x + width; float p4y = p3y;
-        context->DrawLine(p1x, p1y, p2x, p2y, 1.5f); context->DrawLine(p2x, p2y, p3x, p3y, 1.5f); context->DrawLine(p3x, p3y, p4x, p4y, 1.5f);
-    }
-    void SetFontSize(float newSize, IMathRendererContext* ctx) override {
-        innerBox->SetFontSize(newSize, ctx); UpdateMetrics(newSize);
+        float thicknessOver = fontSize * (1.2f / 36.0f);
+        float thicknessTickUp = fontSize * (1.2f / 36.0f);
+        float thicknessTickDown = fontSize * (2.8f / 36.0f);
+        float thicknessMain = fontSize * (1.8f / 36.0f);
+        float topY = currentY - actualOpeningHeight - padTop;
+        float bottomY = currentY + actualOpeningDepth;
+        float p0x = x + padLeft * 0.05f;
+        float p0y = currentY - actualOpeningHeight * 0.30f;
+        float p1x = x + padLeft * 0.35f;
+        float p1y = currentY - actualOpeningHeight * 0.38f;
+        float p2x = x + padLeft * 0.60f;
+        float p2y = bottomY + fontSize * (3.0f / 36.0f);
+        float overLineY = topY + thicknessOver * 0.5f;
+        float p3x = x + padLeft - thicknessMain * 0.5f;
+        float p3y = overLineY - thicknessMain * 0.2f;
+        float p4x = x + width;
+        context->DrawLine(p0x, p0y, p1x, p1y, thicknessTickUp);
+        context->DrawLine(p1x, p1y, p2x, p2y, thicknessTickDown);
+        context->DrawLine(p2x, p2y, p3x, p3y, thicknessMain);
+        float overLineStartX = p3x - thicknessMain * 0.5f + thicknessOver * 0.5f;
+        context->DrawLine(overLineStartX, overLineY, p4x, overLineY, thicknessOver);
     }
     void MapCaret(IMathRendererContext* ctx, float x, float y, float scale, bool isActive, std::vector<CaretMetrics>& metrics) const override {
         float currentY = y + shift;
@@ -347,7 +390,7 @@ public:
         m_pRT->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &m_pBrush);
         m_pDWriteFactory->CreateTextFormat(L"Cambria Math", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 32.0f, L"en-us", &m_pFormatNormal);
-        m_pDWriteFactory->CreateTextFormat(L"Cambria Math", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+        m_pDWriteFactory->CreateTextFormat(L"Cambria", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STRETCH_NORMAL, 32.0f, L"en-us", &m_pFormatItalic);
     }
     void MeasureGlyph(const std::wstring& text, float fontSize, bool isItalic, float& outWidth, float& outHeight, float& outDepth) override {
@@ -382,6 +425,22 @@ public:
     void FillCircle(float x, float y, float r) override {
         D2D1_ELLIPSE ellipse = D2D1::Ellipse(D2D1::Point2F(x, y), r, r);
         m_pRT->FillEllipse(ellipse, m_pBrush.Get());
+    }
+    void FillPolygon(const std::vector<std::pair<float, float>>& vertices) override {
+        if (vertices.size() < 3) return;
+        ComPtr<ID2D1Factory> pFactory;
+        m_pRT->GetFactory(&pFactory);
+        ComPtr<ID2D1GeometrySink> pSink;
+        ComPtr<ID2D1PathGeometry> pPathGeometry;
+        pFactory->CreatePathGeometry(&pPathGeometry);
+        pPathGeometry->Open(&pSink);
+        pSink->BeginFigure(D2D1::Point2F(vertices[0].first, vertices[0].second), D2D1_FIGURE_BEGIN_FILLED);
+        for (size_t i = 1; i < vertices.size(); ++i) {
+            pSink->AddLine(D2D1::Point2F(vertices[i].first, vertices[i].second));
+        }
+        pSink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        pSink->Close();
+        m_pRT->FillGeometry(pPathGeometry.Get(), m_pBrush.Get());
     }
     void SetTextColor(float r, float g, float b, float a = 1.0f) override {
         m_pBrush->SetColor(D2D1::ColorF(r, g, b, a));
@@ -452,11 +511,11 @@ float GetIcp(wchar_t op) {
 float GetIsp(wchar_t op) {
     if (op == L'(') return 0.0f;
     if (op == L'!') return 4.8f;
-    if (op == L'√') return 2.5f;
-    if (op == L'^') return 2.5f;
+    if (op == L'√') return 1.5f;
+    if (op == L'^') return 1.5f;
     if (op == L'_' || op == L'#') return 3.5f;
     if (op == L'@') return 3.0f;
-    if (op == L'/') return 2.0f;
+    if (op == L'/') return 1.5f;
     if (op == L'+' || op == L'-') return 1.0f;
     return 0.0f;
 }
@@ -468,10 +527,19 @@ bool ApplyOperator(std::stack<OpToken>& opStack, std::stack<std::shared_ptr<Box>
     if (opStack.empty()) return false;
     OpToken opInfo = opStack.top();
     wchar_t op = opInfo.ch;
+    auto stripParens = [&](std::shared_ptr<Box> b) {
+        if (auto h = std::dynamic_pointer_cast<HorizontalBox>(b)) {
+            if (h->isParenGroup) {
+                h->hideParens = true;
+                h->SetFontSize(36.0f, ctx);
+            }
+        }
+        };
     if (op == L'√') {
         if (boxStack.empty()) return false;
         opStack.pop();
         std::shared_ptr<Box> inner = boxStack.top(); boxStack.pop();
+        stripParens(inner);
         boxStack.push(std::make_shared<RootBox>(inner));
         return true;
     }
@@ -519,10 +587,13 @@ bool ApplyOperator(std::stack<OpToken>& opStack, std::stack<std::shared_ptr<Box>
         break;
     }
     case L'^':
+        stripParens(right);
         right->SetFontSize(scriptSize, ctx);
         result = std::make_shared<ScriptBox>(left, right, nullptr);
         break;
     case L'/':
+        stripParens(left);
+        stripParens(right);
         result = std::make_shared<FractionBox>(left, right);
         break;
     case L'+':
@@ -553,7 +624,7 @@ bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName)
         L"arcsin", L"arccos", L"arctan",
         L"sinh", L"cosh", L"tanh", L"asin", L"acos", L"atan",
         L"sin", L"cos", L"tan", L"log", L"lim", L"exp", L"max", L"min", L"det",
-        L"ln"
+        L"ln", L"is", L"prime", L"number"
     };
     for (const auto& name : funcNames) {
         if (pos + name.length() <= text.length() &&
@@ -565,6 +636,8 @@ bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName)
     return false;
 }
 BigFloat EvalExpr(const wchar_t*& p);
+BigFloat EvalTerm(const wchar_t*& p);
+BigFloat EvalGroup(const wchar_t*& p);
 BigFloat EvalFactor(const wchar_t*& p) {
     while (*p == L' ' || *p == L'\x200B') p++;
     if (*p == L'-') { p++; return -EvalFactor(p); }
@@ -574,10 +647,22 @@ BigFloat EvalFactor(const wchar_t*& p) {
         p++; val = EvalExpr(p);
         if (*p == L')') p++;
     }
+    else if (wcsncmp(p, L"arcsin", 6) == 0) { p += 6; val = asin(EvalFactor(p)); }
+    else if (wcsncmp(p, L"arccos", 6) == 0) { p += 6; val = acos(EvalFactor(p)); }
+    else if (wcsncmp(p, L"arctan", 6) == 0) { p += 6; val = atan(EvalFactor(p)); }
+    else if (wcsncmp(p, L"sinh", 4) == 0) { p += 4; val = sinh(EvalFactor(p)); }
+    else if (wcsncmp(p, L"cosh", 4) == 0) { p += 4; val = cosh(EvalFactor(p)); }
+    else if (wcsncmp(p, L"tanh", 4) == 0) { p += 4; val = tanh(EvalFactor(p)); }
+    else if (wcsncmp(p, L"asin", 4) == 0) { p += 4; val = asin(EvalFactor(p)); }
+    else if (wcsncmp(p, L"acos", 4) == 0) { p += 4; val = acos(EvalFactor(p)); }
+    else if (wcsncmp(p, L"atan", 4) == 0) { p += 4; val = atan(EvalFactor(p)); }
     else if (wcsncmp(p, L"sin", 3) == 0) { p += 3; val = sin(EvalFactor(p)); }
     else if (wcsncmp(p, L"cos", 3) == 0) { p += 3; val = cos(EvalFactor(p)); }
+    else if (wcsncmp(p, L"tan", 3) == 0) { p += 3; val = tan(EvalFactor(p)); }
     else if (wcsncmp(p, L"log", 3) == 0) { p += 3; val = log10(EvalFactor(p)); }
-    else if (*p == L'√') { p++; val = sqrt(EvalFactor(p)); }
+    else if (wcsncmp(p, L"exp", 3) == 0) { p += 3; val = exp(EvalFactor(p)); }
+    else if (wcsncmp(p, L"ln", 2) == 0) { p += 2; val = log(EvalFactor(p)); }
+    else if (*p == L'√') { p++; val = sqrt(EvalGroup(p)); }
     else if (iswdigit(*p) || *p == L'.') {
         std::string numStr;
         while (iswdigit(*p) || *p == L'.') {
@@ -590,24 +675,35 @@ BigFloat EvalFactor(const wchar_t*& p) {
         p++;
         val = std::numeric_limits<BigFloat>::quiet_NaN();
     }
-    while (*p == L' ' || *p == L'\x200B') p++;
     while (*p == L'!') {
         p++;
         if (val > 1000.0 || val < 0.0) {
             return std::numeric_limits<BigFloat>::quiet_NaN();
         }
         val = boost::math::tgamma(val + 1);
-        while (*p == L' ' || *p == L'\x200B') p++;
     }
     if (*p == L'^') {
         p++;
-        BigFloat exponent = EvalFactor(p);
+        BigFloat exponent = EvalGroup(p);
         if (abs(exponent) > 10000.0) {
             val = std::numeric_limits<BigFloat>::quiet_NaN();
         }
         else {
             val = pow(val, exponent);
         }
+    }
+    return val;
+}
+BigFloat EvalGroup(const wchar_t*& p) {
+    BigFloat val = EvalFactor(p);
+    while (true) {
+        if (*p == L' ' || *p == L'\x200B') break;
+        if (*p == L'*') { p++; val *= EvalFactor(p); }
+        else if (*p == L'/') { p++; val /= EvalFactor(p); }
+        else if (iswdigit(*p) || iswalpha(*p) || *p == L'(' || *p == L'√' || wcsncmp(p, L"sin", 3) == 0 || wcsncmp(p, L"cos", 3) == 0) {
+            val *= EvalFactor(p);
+        }
+        else break;
     }
     return val;
 }
@@ -674,8 +770,53 @@ std::wstring FormatRepeatingDecimal(const std::wstring& numStr) {
     }
     return numStr;
 }
+using boost::multiprecision::cpp_int;
+
+cpp_int gcd_cpp_int(cpp_int a, cpp_int b) {
+    while (b != 0) {
+        cpp_int temp = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
+
+cpp_int pollard_rho(cpp_int n) {
+    if (n % 2 == 0) return 2;
+    cpp_int x = 2, y = 2, d = 1, c = 1;
+    auto f = [&n, &c](const cpp_int& val) { return (val * val + c) % n; };
+    while (d == 1) {
+        x = f(x);
+        y = f(f(y));
+        cpp_int diff = x > y ? x - y : y - x;
+        d = gcd_cpp_int(diff, n);
+        if (d == n) {
+            c++;
+            x = 2;
+            y = 2;
+            d = 1;
+        }
+    }
+    return d;
+}
+
+void factorize_cpp_int(cpp_int n, std::map<cpp_int, int>& factors, boost::random::mt19937& rng) {
+    if (n <= 1) return;
+    if (boost::multiprecision::miller_rabin_test(n, 25, rng)) {
+        factors[n]++;
+        return;
+    }
+    cpp_int divisor = pollard_rho(n);
+    factorize_cpp_int(divisor, factors, rng);
+    factorize_cpp_int(n / divisor, factors, rng);
+}
 std::wstring CalculateResult(std::wstring text) {
-    text.erase(std::remove(text.begin(), text.end(), L'\x200B'), text.end());
+    std::replace(text.begin(), text.end(), L'\x200B', L' ');
+    std::wstring cleanText = text;
+    cleanText.erase(std::remove(cleanText.begin(), cleanText.end(), L' '), cleanText.end());
+    if (cleanText == L"version") {
+        return L"v1.0.1";
+    }
     if (text.empty()) return L"";
     if (text.find(L'=') != std::wstring::npos) return L"";
     bool hasOperator = false;
@@ -687,7 +828,14 @@ std::wstring CalculateResult(std::wstring text) {
             break;
         }
     }
-    if (!hasOperator) return L"";
+    bool isOnlyDigits = !cleanText.empty();
+    for (wchar_t ch : cleanText) {
+        if (!iswdigit(ch)) {
+            isOnlyDigits = false;
+            break;
+        }
+    }
+    if (!hasOperator && !isOnlyDigits) return L"";
     wchar_t last = text.back();
     if (last == L'+' || last == L'-' || last == L'*' || last == L'/' || last == L'^' || last == L'√' || last == L'(') {
         return L"";
@@ -703,6 +851,29 @@ std::wstring CalculateResult(std::wstring text) {
     while (*p == L' ' || *p == L'\x200B') p++;
     if (*p != L'\0') return L"";
     if (boost::math::isnan(result) || boost::math::isinf(result)) return L"";
+    if (isOnlyDigits && result >= 2 && floor(result) == result) {
+        cpp_int n = result.convert_to<cpp_int>();
+        boost::random::mt19937 rng(static_cast<uint32_t>(time(0)));
+        if (boost::multiprecision::miller_rabin_test(n, 25, rng)) {
+            return L"is\x00A0prime\x00A0number";
+        }
+        else {
+            std::map<cpp_int, int> factors;
+            factorize_cpp_int(n, factors, rng);
+            std::wstring factStr = L"";
+            bool first = true;
+            for (auto const& pair : factors) {
+                if (!first) factStr += L" * ";
+                first = false;
+                std::string s = pair.first.str();
+                factStr += std::wstring(s.begin(), s.end());
+                if (pair.second > 1) {
+                    factStr += L"^" + std::to_wstring(pair.second);
+                }
+            }
+            return factStr;
+        }
+    }
     std::string resStr;
     bool formatted = false;
     for (int prec = 150; prec >= 0; prec -= 10) {
@@ -770,7 +941,7 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
         wchar_t ch = text[i];
         if (ch == L' ') {
             if (!expectOperand) {
-                while (!opStack.empty() && GetIsp(opStack.top().ch) >= 2.0f) EvaluateTop(opStack, boxStack, static_cast<int>(i));
+                while (!opStack.empty() && GetIsp(opStack.top().ch) >= 1.5f) EvaluateTop(opStack, boxStack, static_cast<int>(i));
             }
             i++; continue;
         }
@@ -781,7 +952,7 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
                 boxStack.push(dummy);
                 expectOperand = false;
             }
-            while (!opStack.empty() && GetIsp(opStack.top().ch) >= 2.0f) EvaluateTop(opStack, boxStack, static_cast<int>(i));
+            while (!opStack.empty() && GetIsp(opStack.top().ch) >= 1.5f) EvaluateTop(opStack, boxStack, static_cast<int>(i));
             OpToken op = { L'@', -1 };
             while (!opStack.empty() && GetIsp(opStack.top().ch) >= GetIcp(op.ch)) EvaluateTop(opStack, boxStack, static_cast<int>(i));
             opStack.push(op);
@@ -897,6 +1068,9 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
                 size_t baseSize = parenBoxStackSizes.top();
                 parenBoxStackSizes.pop();
                 auto wrap = std::make_shared<HorizontalBox>();
+                wrap->isParenGroup = true;
+                wrap->srcStart = leftParenIdx;
+                wrap->srcEnd = (int)(i + 1);
                 auto lBox = std::make_shared<CharBox>(L"(", normalSize, false, ctx);
                 lBox->srcStart = leftParenIdx; lBox->srcEnd = leftParenIdx + 1;
                 wrap->Add(lBox);
@@ -952,7 +1126,11 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
                 while (!opStack.empty() && GetIsp(opStack.top().ch) >= GetIcp(op.ch)) EvaluateTop(opStack, boxStack, static_cast<int>(i));
                 opStack.push(op);
             }
-            auto box = std::make_shared<CharBox>(std::wstring(1, ch), normalSize, false, ctx);
+            wchar_t displayCh = ch;
+            if (ch == L'*') {
+                displayCh = L'\x22C5';
+            }
+            auto box = std::make_shared<CharBox>(std::wstring(1, displayCh), normalSize, false, ctx);
             box->srcStart = (int)i; box->srcEnd = (int)(i + 1);
             boxStack.push(box);
             expectOperand = false; i++;
@@ -965,6 +1143,9 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
             size_t baseSize = parenBoxStackSizes.top();
             parenBoxStackSizes.pop();
             auto wrap = std::make_shared<HorizontalBox>();
+            wrap->isParenGroup = true;
+            wrap->srcStart = opInfo.idx;
+            wrap->srcEnd = static_cast<int>(text.length());
             auto lBox = std::make_shared<CharBox>(L"(", normalSize, false, ctx);
             lBox->srcStart = opInfo.idx; lBox->srcEnd = opInfo.idx + 1;
             wrap->Add(lBox);
@@ -1062,53 +1243,56 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     {
         int xPos = GET_X_LPARAM(lParam);
         int yPos = GET_Y_LPARAM(lParam);
-        int newPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
-        g_cursorPos = newPos;
-        if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) {
-            g_selectionStart = g_cursorPos;
-        }
-        SetCapture(hWnd);
-        g_isDragging = true;
-        g_caretVisible = true;
-        InvalidateRect(hWnd, nullptr, FALSE);
-    }
-    break;
-    case WM_LBUTTONDBLCLK:
-    {
-        if (g_inputText.empty()) break;
-        int xPos = GET_X_LPARAM(lParam);
-        int yPos = GET_Y_LPARAM(lParam);
         int clickPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
-        auto isWordChar = [](wchar_t c) {
-            return iswdigit(c) || iswalpha(c) || c == L'.';
-            };
-        int leftIdx = clickPos;
-        int rightIdx = clickPos;
-        bool isInsideWord = false;
-        if (clickPos < g_inputText.length() && isWordChar(g_inputText[clickPos])) {
-            isInsideWord = true;
-        }
-        else if (clickPos > 0 && isWordChar(g_inputText[clickPos - 1])) {
-            isInsideWord = true;
-        }
-        if (isInsideWord) {
-            while (leftIdx > 0 && isWordChar(g_inputText[leftIdx - 1])) {
-                leftIdx--;
+        if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) {
+            int selStart = std::min(g_cursorPos, g_selectionStart);
+            int selEnd = std::max(g_cursorPos, g_selectionStart);
+            if (selStart != selEnd && clickPos >= selStart && clickPos <= selEnd) {
+                g_cursorPos = clickPos;
+                g_selectionStart = clickPos;
             }
-            while (rightIdx < g_inputText.length() && isWordChar(g_inputText[rightIdx])) {
-                rightIdx++;
+            else if (g_inputText.empty()) {
+                g_cursorPos = 0;
+                g_selectionStart = 0;
+            }
+            else {
+                auto isWordChar = [](wchar_t c) {
+                    return iswdigit(c) || iswalpha(c) || c == L'.';
+                    };
+                int leftIdx = clickPos;
+                int rightIdx = clickPos;
+                bool isInsideWord = false;
+                if (clickPos < g_inputText.length() && isWordChar(g_inputText[clickPos])) {
+                    isInsideWord = true;
+                }
+                else if (clickPos > 0 && isWordChar(g_inputText[clickPos - 1])) {
+                    isInsideWord = true;
+                }
+                if (isInsideWord) {
+                    while (leftIdx > 0 && isWordChar(g_inputText[leftIdx - 1])) {
+                        leftIdx--;
+                    }
+                    while (rightIdx < g_inputText.length() && isWordChar(g_inputText[rightIdx])) {
+                        rightIdx++;
+                    }
+                }
+                else {
+                    if (clickPos < g_inputText.length()) {
+                        rightIdx = clickPos + 1;
+                    }
+                    else if (clickPos > 0) {
+                        leftIdx = clickPos - 1;
+                    }
+                }
+                g_selectionStart = leftIdx;
+                g_cursorPos = rightIdx;
             }
         }
         else {
-            if (clickPos < g_inputText.length()) {
-                rightIdx = clickPos + 1;
-            }
-            else if (clickPos > 0) {
-                leftIdx = clickPos - 1;
-            }
+            g_cursorPos = clickPos;
         }
-        g_selectionStart = leftIdx;
-        g_cursorPos = rightIdx;
+        SetCapture(hWnd);
+        g_isDragging = true;
         g_caretVisible = true;
         InvalidateRect(hWnd, nullptr, FALSE);
     }
@@ -1148,9 +1332,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_selectionStart = g_cursorPos;
             }
             };
+        auto cleanForClipboard = [](const std::wstring& text) {
+            std::wstring res;
+            for (wchar_t c : text) {
+                if (c == L'\x02' || c == L'\x200B') continue;
+                if (c == L'\x00A0') { res += L' '; continue; }
+                res += c;
+            }
+            return res;
+            };
         switch (wParam) {
         case VK_RETURN:
             g_resultText = CalculateResult(g_inputText);
+            if (!g_resultText.empty()) {
+                CopyToClipboard(hWnd, cleanForClipboard(g_resultText));
+            }
             g_pResultTree.reset();
             InvalidateRect(hWnd, nullptr, FALSE);
             break;
@@ -1216,12 +1412,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             break;
         case 'C':
-            if (ctrlDown && g_cursorPos != g_selectionStart) {
-                int startIdx = std::min(g_cursorPos, g_selectionStart);
-                int endIdx = std::max(g_cursorPos, g_selectionStart);
-                CopyToClipboard(hWnd, g_inputText.substr(startIdx, endIdx - startIdx));
+            if (ctrlDown) {
+                if (g_cursorPos != g_selectionStart) {
+                    int startIdx = std::min(g_cursorPos, g_selectionStart);
+                    int endIdx = std::max(g_cursorPos, g_selectionStart);
+                    CopyToClipboard(hWnd, cleanForClipboard(g_inputText.substr(startIdx, endIdx - startIdx)));
+                }
+                else if (!g_inputText.empty()) {
+                    std::wstring formula = cleanForClipboard(g_inputText);
+                    if (!g_resultText.empty()) {
+                        std::wstring ans = cleanForClipboard(g_resultText);
+                        std::wstring copyText;
+                        if (ans == L"is prime number") {
+                            copyText = formula + L" " + ans;
+                        }
+                        else {
+                            copyText = formula + L" = " + ans;
+                        }
+                        CopyToClipboard(hWnd, copyText);
+                    }
+                    else {
+                        CopyToClipboard(hWnd, formula);
+                    }
+                }
             }
-            break;
+        break;
         case 'X':
             if (ctrlDown && g_cursorPos != g_selectionStart) {
                 int startIdx = std::min(g_cursorPos, g_selectionStart);
@@ -1264,7 +1479,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     wchar_t prevChar = g_inputText[g_cursorPos - 1];
                     if (prevChar == L'(' || prevChar == L'^' || prevChar == L'/' ||
                         prevChar == L'+' || prevChar == L'-' || prevChar == L'=' ||
-                        prevChar == L' ' || prevChar == L'\x200B') {
+                        prevChar == L' ') {
                         shouldAutoCompleteFraction = true;
                     }
                 }
@@ -1297,17 +1512,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pD2DFactory->CreateHwndRenderTarget(D2D1::RenderTargetProperties(), D2D1::HwndRenderTargetProperties(hWnd, size), &g_pRenderTarget);
         }
         g_pRenderTarget->BeginDraw();
-
-        // ★修正: 背景色をモードによって切り替え (ダークモード時は VSCode のような深いグレーに)
         D2D1_COLOR_F bgColor = g_isDarkMode ? D2D1::ColorF(0x1E1E1E) : D2D1::ColorF(D2D1::ColorF::White);
         g_pRenderTarget->Clear(bgColor);
-
         Direct2DContext ctx(g_pRenderTarget.Get(), g_pDWriteFactory.Get());
-
-        // ★修正: 基本の文字色を切り替え
         D2D1_COLOR_F textColor = g_isDarkMode ? D2D1::ColorF(0xD4D4D4) : D2D1::ColorF(D2D1::ColorF::Black);
         ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
-
         if (!g_pLayoutTree) g_pLayoutTree = ParseMathText(g_inputText, &ctx);
         int len = static_cast<int>(g_inputText.length());
         std::vector<CaretMetrics> metrics(len + 1);
@@ -1360,9 +1569,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 float x2 = startX + g_caretMetrics[k + 1].x;
                 float y2 = g_caretMetrics[k + 1].y;
                 float scale2 = g_caretMetrics[k + 1].scale;
-                if (std::abs(y1 - y2) < 1.0f && std::abs(scale1 - scale2) < 0.01f && std::abs(x1 - x2) > 0.01f) {
+                y1 = y2;
+                scale1 = scale2;
+                if (std::abs(x1 - x2) > 0.01f) {
                     float segLeft = std::min(x1, x2);
                     float segRight = std::max(x1, x2);
+
                     if (currentY != -10000.0f && std::abs(currentY - y1) < 1.0f && std::abs(currentScale - scale1) < 0.01f) {
                         currentLeftX = std::min(currentLeftX, segLeft);
                         currentRightX = std::max(currentRightX, segRight);
@@ -1385,18 +1597,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             else {
                 ctx.SetTextColor(0.6f, 0.6f, 0.6f);
-            }            float gap = 20.0f;
-            float eqW, eqH, eqD;
-            ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
-            float equalX = startX + g_pLayoutTree->width + gap;
-            ctx.DrawGlyph(L"=", equalX, startY, 36.0f, false);
-            float resultX = equalX + eqW + gap;
+            }
+            float gap = 20.0f;
+            float resultX = startX + g_pLayoutTree->width + gap;
+            std::wstring cleanInput = g_inputText;
+            cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L'\x200B'), cleanInput.end());
+            cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L' '), cleanInput.end());
+            if (cleanInput != L"version" && g_resultText != L"is\x00A0prime\x00A0number") {
+                float eqW, eqH, eqD;
+                ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
+                ctx.DrawGlyph(L"=", resultX, startY, 36.0f, false);
+                resultX += eqW + gap;
+            }
             RECT rc;
             GetClientRect(hWnd, &rc);
             float maxResultWidth = rc.right - resultX - 20.0f;
             if (!g_pResultTree) {
                 g_pResultTree = ParseMathText(g_resultText, &ctx);
-
                 if (g_pResultTree->width > maxResultWidth) {
                     if (maxResultWidth <= 40.0f) {
                         g_pResultTree = ParseMathText(L"...", &ctx);
@@ -1449,6 +1666,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         KillTimer(hWnd, CARET_TIMER_ID);
         PostQuitMessage(0);
         break;
+	case WM_ERASEBKGND:
+        return 1;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
     }
@@ -1458,9 +1677,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_pD2DFactory.GetAddressOf());
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory3), reinterpret_cast<IUnknown**>(g_pDWriteFactory.GetAddressOf()));
     WNDCLASSEXW wcex = { sizeof(WNDCLASSEX) };
-    wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
     wcex.lpfnWndProc = WndProc;
     wcex.hInstance = hInstance;
+	wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wcex.lpszClassName = L"4mulaWindow";
     RegisterClassExW(&wcex);
