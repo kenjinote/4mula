@@ -455,6 +455,34 @@ int g_cursorPos = 0;
 int g_selectionStart = 0;
 bool g_caretVisible = true;
 const UINT CARET_TIMER_ID = 1;
+const UINT DEMO_TYPING_TIMER_ID = 2;
+const UINT DEMO_PAUSE_TIMER_ID = 3;
+bool g_isDemoMode = false;
+size_t g_demoIndex = 0;
+size_t g_demoCharIndex = 0;
+std::vector<std::wstring> g_demoFormulas;
+void InitDemoFormulas() {
+    g_demoFormulas = {
+        L"version",                         // version
+        L"1+1",                             // 1+1
+        L"(10*(10+1))/2",                   // 1から10までの和（ガウスの公式、結果は55）
+        L"987654321/123456789",             // 不思議な割り算（約8.00000007）
+        L"((1+√(5))/2)^10/√(5)",            // フィボナッチ数列の第10項の近似
+        L"2305843009213693951",             // 第9番目のメルセンヌ素数 (2^61-1)
+        L"tan(1)-(sin(1)/cos(1))",          // タンジェントの定義（結果は0）
+        L"ln(exp(10))",                     // 指数と対数の相殺（結果は10）
+        L"mod(2026^365,7)",                 // 剰余関数
+        L"√(12345678987654321)",            // 回文数の平方根（結果は111111111）
+        L"√(2+√(2+√(2+√(2))))",             // ネストした平方根
+        L"(1+1/10000)^10000",               // 極限によるネイピア数の近似
+        L"2*3.14159*√(2/9.8)",              // 振り子の周期 (L=2m, g=9.8m/s^2)
+        L"4/3*3.14159*6371^3",              // 地球の体積近似 (r=6371km)
+        L"1+1/(1+1/(1+1/(1+1)))",           // 連分数（黄金比の近似）
+        L"1/(√(2*3.14159))*exp(-(0^2)/2)",  // 標準正規分布の確率密度関数 (x=0)
+        L"6.674e-11*5.972e24/(6.371e6^2)",  // 地球表面の重力加速度（万有引力の法則）
+        L"　　4mula"
+    };
+}
 void DeleteSelection() {
     if (g_cursorPos == g_selectionStart) return;
     int startIdx = std::min(g_cursorPos, g_selectionStart);
@@ -499,7 +527,7 @@ std::wstring PasteFromClipboard(HWND hWnd) {
 }
 float GetIcp(wchar_t op) {
     if (op == L'(') return 5.0f;
-    if (op == L'!') return 4.8f;
+    if (op == L'!' || op == L'%') return 4.8f;
     if (op == L'√') return 4.5f;
     if (op == L'^') return 4.0f;
     if (op == L'_' || op == L'#') return 3.5f;
@@ -510,7 +538,7 @@ float GetIcp(wchar_t op) {
 }
 float GetIsp(wchar_t op) {
     if (op == L'(') return 0.0f;
-    if (op == L'!') return 4.8f;
+    if (op == L'!' || op == L'%') return 4.8f;
     if (op == L'√') return 1.5f;
     if (op == L'^') return 1.5f;
     if (op == L'_' || op == L'#') return 3.5f;
@@ -543,16 +571,16 @@ bool ApplyOperator(std::stack<OpToken>& opStack, std::stack<std::shared_ptr<Box>
         boxStack.push(std::make_shared<RootBox>(inner));
         return true;
     }
-    if (op == L'!') {
+    if (op == L'!' || op == L'%') {
         if (boxStack.empty()) return false;
         opStack.pop();
         std::shared_ptr<Box> inner = boxStack.top(); boxStack.pop();
         auto horiz = std::make_shared<HorizontalBox>();
         horiz->Add(inner);
-        auto exclBox = std::make_shared<CharBox>(L"!", 36.0f, false, ctx);
-        exclBox->srcStart = opInfo.idx;
-        exclBox->srcEnd = opInfo.idx + 1;
-        horiz->Add(exclBox);
+        auto postfixBox = std::make_shared<CharBox>(std::wstring(1, op), 36.0f, false, ctx);
+        postfixBox->srcStart = opInfo.idx;
+        postfixBox->srcEnd = opInfo.idx + 1;
+        horiz->Add(postfixBox);
         boxStack.push(horiz);
         return true;
     }
@@ -623,7 +651,9 @@ bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName)
     static const std::vector<std::wstring> funcNames = {
         L"arcsin", L"arccos", L"arctan",
         L"sinh", L"cosh", L"tanh", L"asin", L"acos", L"atan",
-        L"sin", L"cos", L"tan", L"log", L"lim", L"exp", L"max", L"min", L"det",
+        L"log10", L"log2", L"powmod",
+        L"sin", L"cos", L"tan", L"log", L"lim", L"exp", L"max", L"min", L"det", L"mod",
+        L"abs", L"ceil", L"floor", L"round",
         L"ln", L"is", L"prime"
     };
     for (const auto& name : funcNames) {
@@ -638,49 +668,262 @@ bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName)
 BigFloat EvalExpr(const wchar_t*& p);
 BigFloat EvalTerm(const wchar_t*& p);
 BigFloat EvalGroup(const wchar_t*& p);
-BigFloat EvalFactor(const wchar_t*& p) {
+BigFloat EvalPrimary(const wchar_t*& p);
+BigFloat EvalPrimary(const wchar_t*& p) {
     while (*p == L' ' || *p == L'\x200B') p++;
-    if (*p == L'-') { p++; return -EvalFactor(p); }
-    if (*p == L'+') { p++; return EvalFactor(p); }
     BigFloat val = 0.0;
     if (*p == L'(') {
         p++; val = EvalExpr(p);
         if (*p == L')') p++;
     }
-    else if (wcsncmp(p, L"arcsin", 6) == 0) { p += 6; val = asin(EvalFactor(p)); }
-    else if (wcsncmp(p, L"arccos", 6) == 0) { p += 6; val = acos(EvalFactor(p)); }
-    else if (wcsncmp(p, L"arctan", 6) == 0) { p += 6; val = atan(EvalFactor(p)); }
-    else if (wcsncmp(p, L"sinh", 4) == 0) { p += 4; val = sinh(EvalFactor(p)); }
-    else if (wcsncmp(p, L"cosh", 4) == 0) { p += 4; val = cosh(EvalFactor(p)); }
-    else if (wcsncmp(p, L"tanh", 4) == 0) { p += 4; val = tanh(EvalFactor(p)); }
-    else if (wcsncmp(p, L"asin", 4) == 0) { p += 4; val = asin(EvalFactor(p)); }
-    else if (wcsncmp(p, L"acos", 4) == 0) { p += 4; val = acos(EvalFactor(p)); }
-    else if (wcsncmp(p, L"atan", 4) == 0) { p += 4; val = atan(EvalFactor(p)); }
-    else if (wcsncmp(p, L"sin", 3) == 0) { p += 3; val = sin(EvalFactor(p)); }
-    else if (wcsncmp(p, L"cos", 3) == 0) { p += 3; val = cos(EvalFactor(p)); }
-    else if (wcsncmp(p, L"tan", 3) == 0) { p += 3; val = tan(EvalFactor(p)); }
-    else if (wcsncmp(p, L"log", 3) == 0) { p += 3; val = log10(EvalFactor(p)); }
-    else if (wcsncmp(p, L"exp", 3) == 0) { p += 3; val = exp(EvalFactor(p)); }
-    else if (wcsncmp(p, L"ln", 2) == 0) { p += 2; val = log(EvalFactor(p)); }
+    else if (wcsncmp(p, L"arcsin", 6) == 0) { p += 6; val = asin(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"arccos", 6) == 0) { p += 6; val = acos(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"arctan", 6) == 0) { p += 6; val = atan(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"sinh", 4) == 0) { p += 4; val = sinh(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"cosh", 4) == 0) { p += 4; val = cosh(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"tanh", 4) == 0) { p += 4; val = tanh(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"asin", 4) == 0) { p += 4; val = asin(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"acos", 4) == 0) { p += 4; val = acos(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"atan", 4) == 0) { p += 4; val = atan(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"sin", 3) == 0) { p += 3; val = sin(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"cos", 3) == 0) { p += 3; val = cos(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"tan", 3) == 0) { p += 3; val = tan(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"log10", 5) == 0) { p += 5; val = log10(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"log2", 4) == 0) { p += 4; val = log2(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"log", 3) == 0) { p += 3; val = log10(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"exp", 3) == 0) { p += 3; val = exp(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"ln", 2) == 0) { p += 2; val = log(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"lim", 3) == 0) {
+        p += 3;
+        val = EvalPrimary(p);
+    }
+    else if (wcsncmp(p, L"max", 3) == 0 || wcsncmp(p, L"min", 3) == 0) {
+        std::wstring fName(p, 3);
+        p += 3;
+        while (*p == L' ' || *p == L'\x200B') p++;
+        if (*p == L'(') {
+            p++;
+            val = EvalExpr(p);
+            while (true) {
+                while (*p == L' ' || *p == L'\x200B') p++;
+                if (*p == L',') {
+                    p++;
+                    BigFloat nextVal = EvalExpr(p);
+                    if (fName == L"max") { if (nextVal > val) val = nextVal; }
+                    else if (fName == L"min") { if (nextVal < val) val = nextVal; }
+                }
+                else {
+                    break;
+                }
+            }
+            if (*p == L')') p++;
+        }
+        else {
+            val = std::numeric_limits<BigFloat>::quiet_NaN();
+        }
+    }
+    else if (wcsncmp(p, L"mod", 3) == 0) {
+        p += 3;
+        while (*p == L' ' || *p == L'\x200B') p++;
+        if (*p == L'(') {
+            p++;
+            const wchar_t* arg1_start = p;
+            int p_count = 0;
+            const wchar_t* comma_pos = nullptr;
+            const wchar_t* scan = p;
+            while (*scan != L'\0') {
+                if (*scan == L'(') p_count++;
+                else if (*scan == L')') {
+                    if (p_count == 0) break;
+                    p_count--;
+                }
+                else if (p_count == 0 && *scan == L',') {
+                    comma_pos = scan;
+                    break;
+                }
+                scan++;
+            }
+            if (comma_pos != nullptr) {
+                const wchar_t* temp_p = arg1_start;
+                while (*temp_p == L' ' || *temp_p == L'\x200B') temp_p++;
+                bool is_negative = false;
+                if (*temp_p == L'-') { is_negative = true; temp_p++; }
+                else if (*temp_p == L'+') { temp_p++; }
+                BigFloat val_base = EvalPrimary(temp_p);
+                while (*temp_p == L'!' || *temp_p == L'%') {
+                    if (*temp_p == L'!') { temp_p++; val_base = boost::math::tgamma(val_base + 1); }
+                    else if (*temp_p == L'%') { temp_p++; val_base /= 100.0; }
+                }
+                if (is_negative) val_base = -val_base;
+                while (*temp_p == L' ' || *temp_p == L'\x200B') temp_p++;
+                if (*temp_p == L'^') {
+                    temp_p++;
+                    BigFloat val_exp = EvalGroup(temp_p);
+                    while (*temp_p == L' ' || *temp_p == L'\x200B') temp_p++;
+                    if (temp_p == comma_pos) {
+                        p = comma_pos + 1;
+                        BigFloat val_mod = EvalExpr(p);
+                        while (*p == L' ' || *p == L'\x200B') p++;
+                        if (*p == L')') p++;
+                        if (floor(val_base) == val_base && floor(val_exp) == val_exp && floor(val_mod) == val_mod && val_mod != 0 && val_exp >= 0) {
+                            cpp_int base_int = val_base.convert_to<cpp_int>();
+                            cpp_int exp_int = val_exp.convert_to<cpp_int>();
+                            cpp_int mod_int = val_mod.convert_to<cpp_int>();
+                            base_int = base_int % mod_int;
+                            if (base_int < 0) base_int += (mod_int > 0 ? mod_int : -mod_int);
+                            val = BigFloat(boost::multiprecision::powm(base_int, exp_int, mod_int));
+                        }
+                        else {
+                            val = fmod(pow(val_base, val_exp), val_mod);
+                        }
+                        return val;
+                    }
+                }
+            }
+            BigFloat val1 = EvalExpr(p);
+            while (*p == L' ' || *p == L'\x200B') p++;
+            if (*p == L',') {
+                p++;
+                BigFloat val2 = EvalExpr(p);
+                while (*p == L' ' || *p == L'\x200B') p++;
+                if (*p == L')') p++;
+                val = fmod(val1, val2);
+            }
+            else {
+                val = std::numeric_limits<BigFloat>::quiet_NaN();
+            }
+        }
+        else {
+            val = std::numeric_limits<BigFloat>::quiet_NaN();
+        }
+    }
+    else if (wcsncmp(p, L"powmod", 6) == 0) {
+        p += 6;
+        while (*p == L' ' || *p == L'\x200B') p++;
+        if (*p == L'(') {
+            p++;
+            BigFloat val1 = EvalExpr(p);
+            while (*p == L' ' || *p == L'\x200B') p++;
+            if (*p == L',') {
+                p++;
+                BigFloat val2 = EvalExpr(p);
+                while (*p == L' ' || *p == L'\x200B') p++;
+                if (*p == L',') {
+                    p++;
+                    BigFloat val3 = EvalExpr(p);
+                    while (*p == L' ' || *p == L'\x200B') p++;
+                    if (*p == L')') p++;
+                    if (floor(val1) == val1 && floor(val2) == val2 && floor(val3) == val3 && val3 != 0 && val2 >= 0) {
+                        cpp_int base = val1.convert_to<cpp_int>();
+                        cpp_int exp = val2.convert_to<cpp_int>();
+                        cpp_int modulo = val3.convert_to<cpp_int>();
+                        cpp_int res = boost::multiprecision::powm(base, exp, modulo);
+                        val = BigFloat(res);
+                    }
+                    else {
+                        val = std::numeric_limits<BigFloat>::quiet_NaN();
+                    }
+                }
+                else {
+                    val = std::numeric_limits<BigFloat>::quiet_NaN();
+                }
+            }
+            else {
+                val = std::numeric_limits<BigFloat>::quiet_NaN();
+            }
+        }
+        else {
+            val = std::numeric_limits<BigFloat>::quiet_NaN();
+        }
+    }
+    else if (wcsncmp(p, L"abs", 3) == 0) { p += 3; val = abs(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"ceil", 4) == 0) { p += 4; val = ceil(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"floor", 5) == 0) { p += 5; val = floor(EvalPrimary(p)); }
+    else if (wcsncmp(p, L"round", 5) == 0) {
+        p += 5;
+        while (*p == L' ' || *p == L'\x200B') p++;
+        if (*p == L'(') {
+            p++;
+            BigFloat val1 = EvalExpr(p);
+            while (*p == L' ' || *p == L'\x200B') p++;
+            if (*p == L',') {
+                p++;
+                BigFloat val2 = EvalExpr(p);
+                while (*p == L' ' || *p == L'\x200B') p++;
+                if (*p == L')') p++;
+                BigFloat factor = pow(BigFloat(10), val2);
+                val = round(val1 * factor) / factor;
+            }
+            else {
+                if (*p == L')') p++;
+                val = round(val1);
+            }
+        }
+        else {
+            val = std::numeric_limits<BigFloat>::quiet_NaN();
+        }
+    }
     else if (*p == L'√') { p++; val = sqrt(EvalGroup(p)); }
     else if (iswdigit(*p) || *p == L'.') {
-        std::string numStr;
-        while (iswdigit(*p) || *p == L'.') {
-            numStr += static_cast<char>(*p);
-            p++;
+        if (*p == L'0' && (*(p + 1) == L'x' || *(p + 1) == L'X')) {
+            std::string hexStr = "0x";
+            p += 2;
+            while (iswdigit(*p) || (*p >= L'a' && *p <= L'f') || (*p >= L'A' && *p <= L'F')) {
+                hexStr += static_cast<char>(*p);
+                p++;
+            }
+            if (hexStr.length() == 2) {
+                val = std::numeric_limits<BigFloat>::quiet_NaN();
+            }
+            else {
+                val = BigFloat(cpp_int(hexStr));
+            }
         }
-        val = BigFloat(numStr);
+        else {
+            std::string numStr;
+            while (iswdigit(*p) || *p == L'.') {
+                numStr += static_cast<char>(*p);
+                p++;
+            }
+            if (*p == L'e' || *p == L'E') {
+                const wchar_t* temp = p + 1;
+                if (*temp == L'+' || *temp == L'-') temp++;
+                if (iswdigit(*temp)) {
+                    numStr += static_cast<char>(*p++);
+                    if (*p == L'+' || *p == L'-') {
+                        numStr += static_cast<char>(*p++);
+                    }
+                    while (iswdigit(*p)) {
+                        numStr += static_cast<char>(*p++);
+                    }
+                }
+            }
+            val = BigFloat(numStr);
+        }
     }
     else if (iswalpha(*p)) {
         p++;
         val = std::numeric_limits<BigFloat>::quiet_NaN();
     }
-    while (*p == L'!') {
-        p++;
-        if (val > 1000.0 || val < 0.0) {
-            return std::numeric_limits<BigFloat>::quiet_NaN();
+    return val;
+}
+BigFloat EvalFactor(const wchar_t*& p) {
+    while (*p == L' ' || *p == L'\x200B') p++;
+    if (*p == L'-') { p++; return -EvalFactor(p); }
+    if (*p == L'+') { p++; return EvalFactor(p); }
+    BigFloat val = EvalPrimary(p);
+    while (*p == L'!' || *p == L'%') {
+        if (*p == L'!') {
+            p++;
+            if (val > 1000.0 || val < 0.0) {
+                return std::numeric_limits<BigFloat>::quiet_NaN();
+            }
+            val = boost::math::tgamma(val + 1);
         }
-        val = boost::math::tgamma(val + 1);
+        else if (*p == L'%') {
+            p++;
+            val /= 100.0;
+        }
     }
     if (*p == L'^') {
         p++;
@@ -815,7 +1058,7 @@ std::wstring CalculateResult(std::wstring text) {
     std::wstring cleanText = text;
     cleanText.erase(std::remove(cleanText.begin(), cleanText.end(), L' '), cleanText.end());
     if (cleanText == L"version") {
-        return L"v1.0.1";
+        return L"v1.0.2";
     }
     if (text.empty()) return L"";
     if (text.find(L'=') != std::wstring::npos) return L"";
@@ -823,7 +1066,7 @@ std::wstring CalculateResult(std::wstring text) {
     for (wchar_t ch : text) {
         if (ch == L'+' || ch == L'-' || ch == L'*' || ch == L'/' ||
             ch == L'^' || ch == L'√' || ch == L'(' || ch == L')' ||
-            ch == L'!' || iswalpha(ch)) {
+            ch == L'!' || ch == L'%' || iswalpha(ch)) {
             hasOperator = true;
             break;
         }
@@ -1034,7 +1277,7 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
             opStack.push({ ch, (int)i });
             expectOperand = true; i++;
         }
-        else if (ch == L'!') {
+        else if (ch == L'!' || ch == L'%') {
             if (expectOperand) {
                 auto dummy = std::make_shared<HorizontalBox>();
                 dummy->srcStart = (int)i;
@@ -1119,6 +1362,16 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
             while (!opStack.empty() && GetIsp(opStack.top().ch) >= GetIcp(ch)) EvaluateTop(opStack, boxStack, static_cast<int>(i));
             opStack.push({ ch, (int)i });
             expectOperand = true; i++;
+        }
+        else if (ch == L',') {
+            while (!opStack.empty() && GetIsp(opStack.top().ch) >= 1.0f) {
+                EvaluateTop(opStack, boxStack, static_cast<int>(i));
+            }
+            auto box = std::make_shared<CharBox>(L",", normalSize, false, ctx);
+            box->srcStart = (int)i; box->srcEnd = (int)(i + 1);
+            boxStack.push(box);
+            expectOperand = true;
+            i++;
         }
         else {
             if (!expectOperand) {
@@ -1222,7 +1475,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         g_isDarkMode = IsSystemDarkMode();
         ApplyTitleBarTheme(hWnd, g_isDarkMode);
         SetTimer(hWnd, CARET_TIMER_ID, 500, nullptr);
-        break;
+    break;
     case WM_SETTINGCHANGE:
         if (lParam != 0) {
             LPCWSTR str = reinterpret_cast<LPCWSTR>(lParam);
@@ -1238,8 +1491,61 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_caretVisible = !g_caretVisible;
             InvalidateRect(hWnd, nullptr, FALSE);
         }
+        else if (wParam == DEMO_TYPING_TIMER_ID && g_isDemoMode) {
+            if (g_demoCharIndex < g_demoFormulas[g_demoIndex].length()) {
+                g_inputText += g_demoFormulas[g_demoIndex][g_demoCharIndex];
+                g_demoCharIndex++;
+                g_cursorPos = static_cast<int>(g_inputText.length());
+                g_selectionStart = g_cursorPos;
+                g_resultText = CalculateResult(g_inputText);
+                g_pResultTree.reset();
+                g_pLayoutTree.reset();
+                g_caretVisible = true;
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            else {
+                if (!g_caretMetrics.empty() &&
+                    g_cursorPos < g_caretMetrics.size() &&
+                    g_caretMetrics[g_cursorPos].isActive) {
+                    g_inputText.insert(g_cursorPos, 1, L'\x200B');
+                    g_cursorPos++;
+                    g_selectionStart = g_cursorPos;
+                    g_pLayoutTree.reset();
+                    g_caretVisible = true;
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                }
+                else {
+                    KillTimer(hWnd, DEMO_TYPING_TIMER_ID);
+                    SetTimer(hWnd, DEMO_PAUSE_TIMER_ID, 400, nullptr);
+                }
+            }
+        }
+        else if (wParam == DEMO_PAUSE_TIMER_ID && g_isDemoMode) {
+            KillTimer(hWnd, DEMO_PAUSE_TIMER_ID);
+            if (g_demoIndex >= g_demoFormulas.size() - 1) {
+                g_isDemoMode = false;
+            }
+            else {
+                g_demoIndex++;
+                g_demoCharIndex = 0;
+                g_inputText.clear();
+                g_cursorPos = 0;
+                g_selectionStart = 0;
+                g_resultText = L"";
+                g_pResultTree.reset();
+                g_pLayoutTree.reset();
+                InvalidateRect(hWnd, nullptr, FALSE);
+                SetTimer(hWnd, DEMO_TYPING_TIMER_ID, 50, nullptr);
+            }
+        }
         break;
     case WM_LBUTTONDOWN:
+    if (g_isDemoMode) {
+        g_inputText.clear();
+        g_cursorPos = 0;
+        g_selectionStart = 0;
+        SetTimer(hWnd, DEMO_TYPING_TIMER_ID, 100, nullptr);
+    }
     {
         int xPos = GET_X_LPARAM(lParam);
         int yPos = GET_Y_LPARAM(lParam);
@@ -1664,6 +1970,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     break;
     case WM_DESTROY:
         KillTimer(hWnd, CARET_TIMER_ID);
+        if (g_isDemoMode) {
+            KillTimer(hWnd, DEMO_TYPING_TIMER_ID);
+            KillTimer(hWnd, DEMO_PAUSE_TIMER_ID);
+        }
         PostQuitMessage(0);
         break;
 	case WM_ERASEBKGND:
@@ -1674,6 +1984,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     return 0;
 }
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
+    std::wstring cmdLine(lpCmdLine);
+    if (false) {
+        g_isDemoMode = true;
+        InitDemoFormulas();
+    }
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_pD2DFactory.GetAddressOf());
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory3), reinterpret_cast<IUnknown**>(g_pDWriteFactory.GetAddressOf()));
     WNDCLASSEXW wcex = { sizeof(WNDCLASSEX) };
