@@ -624,7 +624,7 @@ bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName)
         L"arcsin", L"arccos", L"arctan",
         L"sinh", L"cosh", L"tanh", L"asin", L"acos", L"atan",
         L"sin", L"cos", L"tan", L"log", L"lim", L"exp", L"max", L"min", L"det",
-        L"ln", L"is", L"prime", L"number"
+        L"ln", L"is", L"prime"
     };
     for (const auto& name : funcNames) {
         if (pos + name.length() <= text.length() &&
@@ -855,7 +855,7 @@ std::wstring CalculateResult(std::wstring text) {
         cpp_int n = result.convert_to<cpp_int>();
         boost::random::mt19937 rng(static_cast<uint32_t>(time(0)));
         if (boost::multiprecision::miller_rabin_test(n, 25, rng)) {
-            return L"is\x00A0prime\x00A0number";
+            return L"is\x00A0prime";
         }
         else {
             std::map<cpp_int, int> factors;
@@ -1423,7 +1423,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     if (!g_resultText.empty()) {
                         std::wstring ans = cleanForClipboard(g_resultText);
                         std::wstring copyText;
-                        if (ans == L"is prime number") {
+                        if (ans == L"is prime") {
                             copyText = formula + L" " + ans;
                         }
                         else {
@@ -1603,7 +1603,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             std::wstring cleanInput = g_inputText;
             cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L'\x200B'), cleanInput.end());
             cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L' '), cleanInput.end());
-            if (cleanInput != L"version" && g_resultText != L"is\x00A0prime\x00A0number") {
+            if (cleanInput != L"version" && g_resultText != L"is\x00A0prime") {
                 float eqW, eqH, eqD;
                 ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
                 ctx.DrawGlyph(L"=", resultX, startY, 36.0f, false);
