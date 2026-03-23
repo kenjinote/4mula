@@ -1058,7 +1058,7 @@ std::wstring CalculateResult(std::wstring text) {
     std::wstring cleanText = text;
     cleanText.erase(std::remove(cleanText.begin(), cleanText.end(), L' '), cleanText.end());
     if (cleanText == L"version") {
-        return L"v1.0.2";
+        return L"v1.0.3";
     }
     if (text.empty()) return L"";
     if (text.find(L'=') != std::wstring::npos) return L"";
