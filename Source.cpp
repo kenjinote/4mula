@@ -533,6 +533,7 @@ float GetIcp(wchar_t op) {
     if (op == L'_' || op == L'#') return 3.5f;
     if (op == L'@') return 3.0f;
     if (op == L'/') return 2.0f;
+    if (op == L'*') return 1.5f;
     if (op == L'+' || op == L'-') return 1.0f;
     return 0.0f;
 }
@@ -544,6 +545,7 @@ float GetIsp(wchar_t op) {
     if (op == L'_' || op == L'#') return 3.5f;
     if (op == L'@') return 3.0f;
     if (op == L'/') return 1.5f;
+    if (op == L'*') return 1.5f;
     if (op == L'+' || op == L'-') return 1.0f;
     return 0.0f;
 }
@@ -619,6 +621,20 @@ bool ApplyOperator(std::stack<OpToken>& opStack, std::stack<std::shared_ptr<Box>
         right->SetFontSize(scriptSize, ctx);
         result = std::make_shared<ScriptBox>(left, right, nullptr);
         break;
+    case L'*':
+    {
+        auto horiz = std::make_shared<HorizontalBox>();
+        horiz->Add(left);
+        horiz->Add(std::make_shared<SpaceBox>(4.0f));
+        auto opBox = std::make_shared<CharBox>(std::wstring(1, L'\x22C5'), normalSize, false, ctx);
+        opBox->srcStart = opInfo.idx;
+        opBox->srcEnd = opInfo.idx + 1;
+        horiz->Add(opBox);
+        horiz->Add(std::make_shared<SpaceBox>(4.0f));
+        horiz->Add(right);
+        result = horiz;
+        break;
+    }
     case L'/':
         stripParens(left);
         stripParens(right);
@@ -1358,7 +1374,7 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
             }
             i++;
         }
-        else if (ch == L'^' || ch == L'/') {
+        else if (ch == L'^' || ch == L'/' || ch == L'*') {
             while (!opStack.empty() && GetIsp(opStack.top().ch) >= GetIcp(ch)) EvaluateTop(opStack, boxStack, static_cast<int>(i));
             opStack.push({ ch, (int)i });
             expectOperand = true; i++;
@@ -1379,11 +1395,7 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
                 while (!opStack.empty() && GetIsp(opStack.top().ch) >= GetIcp(op.ch)) EvaluateTop(opStack, boxStack, static_cast<int>(i));
                 opStack.push(op);
             }
-            wchar_t displayCh = ch;
-            if (ch == L'*') {
-                displayCh = L'\x22C5';
-            }
-            auto box = std::make_shared<CharBox>(std::wstring(1, displayCh), normalSize, false, ctx);
+            auto box = std::make_shared<CharBox>(std::wstring(1, ch), normalSize, false, ctx);
             box->srcStart = (int)i; box->srcEnd = (int)(i + 1);
             boxStack.push(box);
             expectOperand = false; i++;
