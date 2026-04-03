@@ -16,6 +16,8 @@
 #include <stack>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
+#include <shlobj.h>
 #include <boost/multiprecision/cpp_dec_float.hpp>
 #include <boost/math/special_functions/gamma.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
@@ -24,14 +26,95 @@
 #include <map>
 #include <ctime>
 #include "resource.h"
+
 using namespace boost::multiprecision;
 typedef boost::multiprecision::number<boost::multiprecision::cpp_dec_float<500>> BigFloat;
 using namespace Microsoft::WRL;
+
 class Box;
 std::wstring g_resultText = L"";
 std::shared_ptr<Box> g_pResultTree = nullptr;
 bool g_isDragging = false;
 bool g_isDarkMode = false;
+
+// -----------------------------------------------------
+// 追加: 保存リストとUIステート管理
+// -----------------------------------------------------
+struct SavedFormula {
+    std::wstring formula;
+    std::wstring result;
+    std::shared_ptr<Box> pFormulaTree;
+    std::shared_ptr<Box> pResultTree;
+};
+std::vector<SavedFormula> g_savedFormulas;
+int g_selectedIndex = -1; // -1 は何も選択されていない状態
+float g_scrollOffsetY = 0.0f;
+float g_maxScrollY = 0.0f;
+bool g_isDraggingScrollbar = false;
+float g_dragStartY = 0.0f;
+float g_dragStartScrollY = 0.0f;
+D2D1_RECT_F g_pinButtonRect = { 0, 0, 0, 0 };
+D2D1_RECT_F g_scrollbarThumbRect = { 0, 0, 0, 0 };
+
+const float INPUT_AREA_HEIGHT = 120.0f;
+const float LIST_ITEM_HEIGHT = 80.0f;
+
+std::string WideToUTF8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+std::wstring UTF8ToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+std::wstring GetSaveFilePath() {
+    PWSTR path = nullptr;
+    std::wstring result = L"4mula_saved.txt"; // 取得失敗時のフォールバック
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path))) {
+        std::wstring dir = std::wstring(path) + L"\\4mula";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        result = dir + L"\\4mula_saved.txt";
+        CoTaskMemFree(path);
+    }
+    return result;
+}
+
+void SaveFormulasToFile() {
+    std::wstring path = GetSaveFilePath();
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return;
+
+    for (const auto& item : g_savedFormulas) {
+        out << WideToUTF8(item.formula) << "\t" << WideToUTF8(item.result) << "\n";
+    }
+}
+
+void LoadFormulasFromFile() {
+    std::wstring path = GetSaveFilePath();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        std::wstring wline = UTF8ToWide(line);
+        size_t tabPos = wline.find(L'\t');
+        if (tabPos != std::wstring::npos) {
+            SavedFormula sf;
+            sf.formula = wline.substr(0, tabPos);
+            sf.result = wline.substr(tabPos + 1);
+            g_savedFormulas.push_back(sf);
+        }
+    }
+}
+
 class IMathRendererContext {
 public:
     virtual ~IMathRendererContext() = default;
@@ -42,6 +125,7 @@ public:
     virtual void MeasureGlyph(const std::wstring& text, float fontSize, bool isItalic, float& outWidth, float& outHeight, float& outDepth) = 0;
     virtual void SetTextColor(float r, float g, float b, float a = 1.0f) = 0;
 };
+
 struct CaretMetrics {
     float x = -1.0f;
     float y = 0.0f;
@@ -50,6 +134,7 @@ struct CaretMetrics {
 };
 std::vector<CaretMetrics> g_caretMetrics;
 extern int g_cursorPos;
+
 class Box {
 public:
     float width = 0.0f;
@@ -63,6 +148,7 @@ public:
     virtual void SetFontSize(float newSize, IMathRendererContext* ctx) {}
     virtual void MapCaret(IMathRendererContext* ctx, float x, float y, float scale, bool isActive, std::vector<CaretMetrics>& metrics) const {}
 };
+
 class CharBox : public Box {
 public:
     std::wstring character;
@@ -110,6 +196,7 @@ public:
         }
     }
 };
+
 class SpaceBox : public Box {
     float emRatio;
 public:
@@ -134,6 +221,7 @@ public:
         }
     }
 };
+
 class HorizontalBox : public Box {
 public:
     std::vector<std::shared_ptr<Box>> children;
@@ -199,6 +287,7 @@ public:
         }
     }
 };
+
 class FractionBox : public Box {
     std::shared_ptr<Box> numerator;
     std::shared_ptr<Box> denominator;
@@ -243,6 +332,7 @@ public:
         denominator->MapCaret(ctx, denX, mathAxis + gap + actualDenHeight, scale, true, metrics);
     }
 };
+
 class ScriptBox : public Box {
     std::shared_ptr<Box> baseBox; std::shared_ptr<Box> superscript; std::shared_ptr<Box> subscript;
 public:
@@ -284,6 +374,7 @@ public:
         if (subscript) subscript->MapCaret(ctx, scriptX, currentY, scale * 0.65f, true, metrics);
     }
 };
+
 class StringBox : public Box {
 public:
     std::wstring text; float fontSize; bool isItalic;
@@ -308,6 +399,7 @@ public:
         }
     }
 };
+
 class DotBox : public Box {
     std::shared_ptr<Box> innerBox;
 public:
@@ -333,6 +425,7 @@ public:
         innerBox->MapCaret(ctx, x, y + shift, scale, isActive, metrics);
     }
 };
+
 class RootBox : public Box {
     std::shared_ptr<Box> innerBox;
     float fontSize = 36.0f;
@@ -378,6 +471,7 @@ public:
         innerBox->MapCaret(ctx, x + padLeft, currentY, scale, true, metrics);
     }
 };
+
 class Direct2DContext : public IMathRendererContext {
     ComPtr<ID2D1RenderTarget> m_pRT;
     ComPtr<IDWriteFactory3> m_pDWriteFactory;
@@ -446,9 +540,11 @@ public:
         m_pBrush->SetColor(D2D1::ColorF(r, g, b, a));
     }
 };
+
 ComPtr<ID2D1Factory7> g_pD2DFactory;
 ComPtr<IDWriteFactory3> g_pDWriteFactory;
 ComPtr<ID2D1HwndRenderTarget> g_pRenderTarget;
+ComPtr<IDWriteTextFormat> g_pUiTextFormat; // 追加
 std::shared_ptr<Box> g_pLayoutTree;
 std::wstring g_inputText = L"";
 int g_cursorPos = 0;
@@ -461,28 +557,30 @@ bool g_isDemoMode = false;
 size_t g_demoIndex = 0;
 size_t g_demoCharIndex = 0;
 std::vector<std::wstring> g_demoFormulas;
+
 void InitDemoFormulas() {
     g_demoFormulas = {
-        L"version",                         // version
-        L"1+1",                             // 1+1
-        L"(10*(10+1))/2",                   // 1から10までの和（ガウスの公式、結果は55）
-        L"987654321/123456789",             // 不思議な割り算（約8.00000007）
-        L"((1+√(5))/2)^10/√(5)",            // フィボナッチ数列の第10項の近似
-        L"2305843009213693951",             // 第9番目のメルセンヌ素数 (2^61-1)
-        L"tan(1)-(sin(1)/cos(1))",          // タンジェントの定義（結果は0）
-        L"ln(exp(10))",                     // 指数と対数の相殺（結果は10）
-        L"mod(2026^365,7)",                 // 剰余関数
-        L"√(12345678987654321)",            // 回文数の平方根（結果は111111111）
-        L"√(2+√(2+√(2+√(2))))",             // ネストした平方根
-        L"(1+1/10000)^10000",               // 極限によるネイピア数の近似
-        L"2*3.14159*√(2/9.8)",              // 振り子の周期 (L=2m, g=9.8m/s^2)
-        L"4/3*3.14159*6371^3",              // 地球の体積近似 (r=6371km)
-        L"1+1/(1+1/(1+1/(1+1)))",           // 連分数（黄金比の近似）
-        L"1/(√(2*3.14159))*exp(-(0^2)/2)",  // 標準正規分布の確率密度関数 (x=0)
-        L"6.674e-11*5.972e24/(6.371e6^2)",  // 地球表面の重力加速度（万有引力の法則）
+        L"version",
+        L"1+1",
+        L"(10*(10+1))/2",
+        L"987654321/123456789",
+        L"((1+√(5))/2)^10/√(5)",
+        L"2305843009213693951",
+        L"tan(1)-(sin(1)/cos(1))",
+        L"ln(exp(10))",
+        L"mod(2026^365,7)",
+        L"√(12345678987654321)",
+        L"√(2+√(2+√(2+√(2))))",
+        L"(1+1/10000)^10000",
+        L"2*3.14159*√(2/9.8)",
+        L"4/3*3.14159*6371^3",
+        L"1+1/(1+1/(1+1/(1+1)))",
+        L"1/(√(2*3.14159))*exp(-(0^2)/2)",
+        L"6.674e-11*5.972e24/(6.371e6^2)",
         L"　　4mula"
     };
 }
+
 void DeleteSelection() {
     if (g_cursorPos == g_selectionStart) return;
     int startIdx = std::min(g_cursorPos, g_selectionStart);
@@ -491,6 +589,7 @@ void DeleteSelection() {
     g_cursorPos = startIdx;
     g_selectionStart = startIdx;
 }
+
 void CopyToClipboard(HWND hWnd, const std::wstring& text) {
     if (text.empty()) return;
     if (!OpenClipboard(hWnd)) return;
@@ -510,6 +609,7 @@ void CopyToClipboard(HWND hWnd, const std::wstring& text) {
     }
     CloseClipboard();
 }
+
 std::wstring PasteFromClipboard(HWND hWnd) {
     std::wstring result = L"";
     if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return result;
@@ -525,6 +625,7 @@ std::wstring PasteFromClipboard(HWND hWnd) {
     CloseClipboard();
     return result;
 }
+
 float GetIcp(wchar_t op) {
     if (op == L'(') return 5.0f;
     if (op == L'!' || op == L'%') return 4.8f;
@@ -537,6 +638,7 @@ float GetIcp(wchar_t op) {
     if (op == L'+' || op == L'-') return 1.0f;
     return 0.0f;
 }
+
 float GetIsp(wchar_t op) {
     if (op == L'(') return 0.0f;
     if (op == L'!' || op == L'%') return 4.8f;
@@ -549,10 +651,12 @@ float GetIsp(wchar_t op) {
     if (op == L'+' || op == L'-') return 1.0f;
     return 0.0f;
 }
+
 struct OpToken {
     wchar_t ch;
     int idx;
 };
+
 bool ApplyOperator(std::stack<OpToken>& opStack, std::stack<std::shared_ptr<Box>>& boxStack, IMathRendererContext* ctx) {
     if (opStack.empty()) return false;
     OpToken opInfo = opStack.top();
@@ -663,6 +767,7 @@ bool ApplyOperator(std::stack<OpToken>& opStack, std::stack<std::shared_ptr<Box>
     }
     return false;
 }
+
 bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName) {
     static const std::vector<std::wstring> funcNames = {
         L"arcsin", L"arccos", L"arctan",
@@ -681,10 +786,12 @@ bool IsFunctionName(const std::wstring& text, size_t pos, std::wstring& outName)
     }
     return false;
 }
+
 BigFloat EvalExpr(const wchar_t*& p);
 BigFloat EvalTerm(const wchar_t*& p);
 BigFloat EvalGroup(const wchar_t*& p);
 BigFloat EvalPrimary(const wchar_t*& p);
+
 BigFloat EvalPrimary(const wchar_t*& p) {
     while (*p == L' ' || *p == L'\x200B') p++;
     BigFloat val = 0.0;
@@ -923,6 +1030,7 @@ BigFloat EvalPrimary(const wchar_t*& p) {
     }
     return val;
 }
+
 BigFloat EvalFactor(const wchar_t*& p) {
     while (*p == L' ' || *p == L'\x200B') p++;
     if (*p == L'-') { p++; return -EvalFactor(p); }
@@ -953,6 +1061,7 @@ BigFloat EvalFactor(const wchar_t*& p) {
     }
     return val;
 }
+
 BigFloat EvalGroup(const wchar_t*& p) {
     BigFloat val = EvalFactor(p);
     while (true) {
@@ -966,6 +1075,7 @@ BigFloat EvalGroup(const wchar_t*& p) {
     }
     return val;
 }
+
 BigFloat EvalTerm(const wchar_t*& p) {
     BigFloat val = EvalFactor(p);
     while (true) {
@@ -979,6 +1089,7 @@ BigFloat EvalTerm(const wchar_t*& p) {
     }
     return val;
 }
+
 BigFloat EvalExpr(const wchar_t*& p) {
     while (*p == L' ' || *p == L'\x200B') p++;
     BigFloat val = EvalTerm(p);
@@ -990,6 +1101,7 @@ BigFloat EvalExpr(const wchar_t*& p) {
     }
     return val;
 }
+
 std::wstring FormatRepeatingDecimal(const std::wstring& numStr) {
     if (numStr.find(L'e') != std::wstring::npos || numStr.find(L'E') != std::wstring::npos) return numStr;
     size_t dotPos = numStr.find(L'.');
@@ -1029,6 +1141,7 @@ std::wstring FormatRepeatingDecimal(const std::wstring& numStr) {
     }
     return numStr;
 }
+
 using boost::multiprecision::cpp_int;
 
 cpp_int gcd_cpp_int(cpp_int a, cpp_int b) {
@@ -1069,12 +1182,13 @@ void factorize_cpp_int(cpp_int n, std::map<cpp_int, int>& factors, boost::random
     factorize_cpp_int(divisor, factors, rng);
     factorize_cpp_int(n / divisor, factors, rng);
 }
+
 std::wstring CalculateResult(std::wstring text) {
     std::replace(text.begin(), text.end(), L'\x200B', L' ');
     std::wstring cleanText = text;
     cleanText.erase(std::remove(cleanText.begin(), cleanText.end(), L' '), cleanText.end());
     if (cleanText == L"version") {
-        return L"v1.0.4";
+        return L"v1.0.5";
     }
     if (text.empty()) return L"";
     if (text.find(L'=') != std::wstring::npos) return L"";
@@ -1164,6 +1278,7 @@ std::wstring CalculateResult(std::wstring text) {
     wresStr = FormatRepeatingDecimal(wresStr);
     return wresStr;
 }
+
 std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContext* ctx) {
     if (text.empty()) return std::make_shared<HorizontalBox>();
     std::stack<std::shared_ptr<Box>> boxStack;
@@ -1438,12 +1553,11 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
     for (auto it = leftover.rbegin(); it != leftover.rend(); ++it) root->Add(*it);
     return root;
 }
+
 int GetCursorPosFromMouse(HWND hWnd, int mouseX, int mouseY) {
     if (g_caretMetrics.empty()) return 0;
-    RECT clientRect;
-    GetClientRect(hWnd, &clientRect);
     float startX = 50.0f;
-    float startY = (clientRect.bottom - clientRect.top) / 2.0f;
+    float startY = INPUT_AREA_HEIGHT / 2.0f;
     int bestIndex = 0;
     float minDistanceSq = -1.0f;
     for (size_t i = 0; i < g_caretMetrics.size(); ++i) {
@@ -1460,6 +1574,7 @@ int GetCursorPosFromMouse(HWND hWnd, int mouseX, int mouseY) {
     }
     return bestIndex;
 }
+
 bool IsSystemDarkMode() {
     DWORD value = 1;
     DWORD size = sizeof(value);
@@ -1477,17 +1592,20 @@ bool IsSystemDarkMode() {
     }
     return false;
 }
+
 void ApplyTitleBarTheme(HWND hWnd, bool isDark) {
     BOOL dark = isDark ? TRUE : FALSE;
     DwmSetWindowAttribute(hWnd, 20, &dark, sizeof(dark));
 }
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE:
         g_isDarkMode = IsSystemDarkMode();
         ApplyTitleBarTheme(hWnd, g_isDarkMode);
+        LoadFormulasFromFile();
         SetTimer(hWnd, CARET_TIMER_ID, 500, nullptr);
-    break;
+        break;
     case WM_SETTINGCHANGE:
         if (lParam != 0) {
             LPCWSTR str = reinterpret_cast<LPCWSTR>(lParam);
@@ -1552,74 +1670,178 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         break;
     case WM_LBUTTONDOWN:
-    if (g_isDemoMode) {
-        g_inputText.clear();
-        g_cursorPos = 0;
-        g_selectionStart = 0;
-        SetTimer(hWnd, DEMO_TYPING_TIMER_ID, 100, nullptr);
-    }
-    {
-        int xPos = GET_X_LPARAM(lParam);
-        int yPos = GET_Y_LPARAM(lParam);
-        int clickPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
-        if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) {
-            int selStart = std::min(g_cursorPos, g_selectionStart);
-            int selEnd = std::max(g_cursorPos, g_selectionStart);
-            if (selStart != selEnd && clickPos >= selStart && clickPos <= selEnd) {
-                g_cursorPos = clickPos;
-                g_selectionStart = clickPos;
-            }
-            else if (g_inputText.empty()) {
-                g_cursorPos = 0;
-                g_selectionStart = 0;
-            }
-            else {
-                auto isWordChar = [](wchar_t c) {
-                    return iswdigit(c) || iswalpha(c) || c == L'.';
-                    };
-                int leftIdx = clickPos;
-                int rightIdx = clickPos;
-                bool isInsideWord = false;
-                if (clickPos < g_inputText.length() && isWordChar(g_inputText[clickPos])) {
-                    isInsideWord = true;
-                }
-                else if (clickPos > 0 && isWordChar(g_inputText[clickPos - 1])) {
-                    isInsideWord = true;
-                }
-                if (isInsideWord) {
-                    while (leftIdx > 0 && isWordChar(g_inputText[leftIdx - 1])) {
-                        leftIdx--;
-                    }
-                    while (rightIdx < g_inputText.length() && isWordChar(g_inputText[rightIdx])) {
-                        rightIdx++;
-                    }
-                }
-                else {
-                    if (clickPos < g_inputText.length()) {
-                        rightIdx = clickPos + 1;
-                    }
-                    else if (clickPos > 0) {
-                        leftIdx = clickPos - 1;
-                    }
-                }
-                g_selectionStart = leftIdx;
-                g_cursorPos = rightIdx;
-            }
+        if (g_isDemoMode) {
+            g_inputText.clear();
+            g_cursorPos = 0;
+            g_selectionStart = 0;
+            SetTimer(hWnd, DEMO_TYPING_TIMER_ID, 100, nullptr);
         }
-        else {
-            g_cursorPos = clickPos;
-        }
-        SetCapture(hWnd);
-        g_isDragging = true;
-        g_caretVisible = true;
-        InvalidateRect(hWnd, nullptr, FALSE);
-    }
-    break;
-    case WM_MOUSEMOVE:
-    {
-        if (g_isDragging) {
+        {
             int xPos = GET_X_LPARAM(lParam);
             int yPos = GET_Y_LPARAM(lParam);
+
+            // ピンボタンの判定
+            if (xPos >= g_pinButtonRect.left && xPos <= g_pinButtonRect.right &&
+                yPos >= g_pinButtonRect.top && yPos <= g_pinButtonRect.bottom) {
+                bool isDup = false;
+                for (auto& f : g_savedFormulas) {
+                    if (f.formula == g_inputText) { isDup = true; break; }
+                }
+                if (!isDup && !g_inputText.empty() && !g_resultText.empty()) {
+                    SavedFormula sf;
+                    sf.formula = g_inputText;
+                    sf.result = g_resultText;
+                    g_savedFormulas.push_back(sf);
+                    SaveFormulasToFile();
+
+                    RECT clientRect;
+                    GetClientRect(hWnd, &clientRect);
+                    float viewHeight = clientRect.bottom - INPUT_AREA_HEIGHT;
+                    float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
+                    g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
+                    g_scrollOffsetY = g_maxScrollY; // 一番下へスクロール
+
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+
+            // スクロールバーの判定
+            if (xPos >= g_scrollbarThumbRect.left && xPos <= g_scrollbarThumbRect.right &&
+                yPos >= g_scrollbarThumbRect.top && yPos <= g_scrollbarThumbRect.bottom) {
+                g_isDraggingScrollbar = true;
+                g_dragStartY = (float)yPos;
+                g_dragStartScrollY = g_scrollOffsetY;
+                SetCapture(hWnd);
+                return 0;
+            }
+
+            // リスト領域のクリック判定（ここを変更）
+            if (yPos > INPUT_AREA_HEIGHT) {
+                RECT rc;
+                GetClientRect(hWnd, &rc);
+
+                // クリックされたY座標から、スクロールオフセットを考慮してインデックスを計算
+                float listClickY = yPos - INPUT_AREA_HEIGHT + g_scrollOffsetY;
+                int itemIndex = static_cast<int>(listClickY / LIST_ITEM_HEIGHT);
+
+                if (itemIndex >= 0 && itemIndex < g_savedFormulas.size()) {
+                    g_selectedIndex = itemIndex; // 選択インデックスを更新
+                    // 削除ボタンの領域計算
+                    float listY = INPUT_AREA_HEIGHT - g_scrollOffsetY + (itemIndex * LIST_ITEM_HEIGHT) + (LIST_ITEM_HEIGHT / 2.0f);
+                    float delBtnWidth = 24.0f;
+                    float delBtnHeight = 24.0f;
+                    float delBtnLeft = rc.right - 60.0f; // スクロールバーと被らない位置
+                    float delBtnRight = delBtnLeft + delBtnWidth;
+                    float delBtnTop = listY - delBtnHeight / 2.0f;
+                    float delBtnBottom = listY + delBtnHeight / 2.0f;
+
+                    // 削除ボタンがクリックされたか判定
+                    if (xPos >= delBtnLeft && xPos <= delBtnRight && yPos >= delBtnTop && yPos <= delBtnBottom) {
+                        // リストから削除してファイルに保存
+                        g_savedFormulas.erase(g_savedFormulas.begin() + itemIndex);
+                        SaveFormulasToFile();
+
+                        // アイテムが減ったのでスクロールの最大値を再計算
+                        float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
+                        float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
+                        g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
+                        if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
+
+                        InvalidateRect(hWnd, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // 削除ボタン以外がクリックされた場合は数式と結果を復元
+                    g_inputText = g_savedFormulas[itemIndex].formula;
+                    g_resultText = g_savedFormulas[itemIndex].result;
+
+                    g_cursorPos = static_cast<int>(g_inputText.length());
+                    g_selectionStart = g_cursorPos;
+
+                    g_pLayoutTree.reset();
+                    g_pResultTree.reset();
+                    g_caretVisible = true;
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                }
+                return 0; // カーソル処理を行わずに終了
+            }
+
+            int clickPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
+            if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) {
+                int selStart = std::min(g_cursorPos, g_selectionStart);
+                int selEnd = std::max(g_cursorPos, g_selectionStart);
+                if (selStart != selEnd && clickPos >= selStart && clickPos <= selEnd) {
+                    g_cursorPos = clickPos;
+                    g_selectionStart = clickPos;
+                }
+                else if (g_inputText.empty()) {
+                    g_cursorPos = 0;
+                    g_selectionStart = 0;
+                }
+                else {
+                    auto isWordChar = [](wchar_t c) {
+                        return iswdigit(c) || iswalpha(c) || c == L'.';
+                        };
+                    int leftIdx = clickPos;
+                    int rightIdx = clickPos;
+                    bool isInsideWord = false;
+                    if (clickPos < g_inputText.length() && isWordChar(g_inputText[clickPos])) {
+                        isInsideWord = true;
+                    }
+                    else if (clickPos > 0 && isWordChar(g_inputText[clickPos - 1])) {
+                        isInsideWord = true;
+                    }
+                    if (isInsideWord) {
+                        while (leftIdx > 0 && isWordChar(g_inputText[leftIdx - 1])) {
+                            leftIdx--;
+                        }
+                        while (rightIdx < g_inputText.length() && isWordChar(g_inputText[rightIdx])) {
+                            rightIdx++;
+                        }
+                    }
+                    else {
+                        if (clickPos < g_inputText.length()) {
+                            rightIdx = clickPos + 1;
+                        }
+                        else if (clickPos > 0) {
+                            leftIdx = clickPos - 1;
+                        }
+                    }
+                    g_selectionStart = leftIdx;
+                    g_cursorPos = rightIdx;
+                }
+            }
+            else {
+                g_cursorPos = clickPos;
+            }
+            SetCapture(hWnd);
+            g_isDragging = true;
+            g_caretVisible = true;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        break;
+    case WM_MOUSEMOVE:
+    {
+        int yPos = GET_Y_LPARAM(lParam);
+        if (g_isDraggingScrollbar) {
+            RECT rc; GetClientRect(hWnd, &rc);
+            float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
+            float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
+            float thumbRatio = viewHeight / contentHeight;
+            float thumbHeight = std::max(30.0f, viewHeight * thumbRatio);
+
+            float deltaY = yPos - g_dragStartY;
+            float scrollDelta = deltaY * (g_maxScrollY / (viewHeight - thumbHeight));
+            g_scrollOffsetY = g_dragStartScrollY + scrollDelta;
+            if (g_scrollOffsetY < 0) g_scrollOffsetY = 0;
+            if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
+            InvalidateRect(hWnd, nullptr, FALSE);
+            return 0;
+        }
+
+        if (g_isDragging) {
+            int xPos = GET_X_LPARAM(lParam);
             int newPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
             if (g_cursorPos != newPos) {
                 g_cursorPos = newPos;
@@ -1631,16 +1853,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     break;
     case WM_LBUTTONUP:
     {
+        if (g_isDraggingScrollbar) {
+            g_isDraggingScrollbar = false;
+            ReleaseCapture();
+            return 0;
+        }
         if (g_isDragging) {
             ReleaseCapture();
             g_isDragging = false;
         }
     }
     break;
+    case WM_MOUSEWHEEL:
+    {
+        float delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        g_scrollOffsetY -= (delta / 120.0f) * 40.0f;
+        if (g_scrollOffsetY < 0) g_scrollOffsetY = 0;
+        if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
+        InvalidateRect(hWnd, nullptr, FALSE);
+    }
+    break;
     case WM_KEYDOWN:
     {
         bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        RECT rc; GetClientRect(hWnd, &rc);
+        float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
+
+        // クリップボードからのペースト処理
         auto executePaste = [&]() {
             std::wstring pastedText = PasteFromClipboard(hWnd);
             if (!pastedText.empty()) {
@@ -1650,6 +1890,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_selectionStart = g_cursorPos;
             }
             };
+
+        // クリップボードにコピーする前のテキスト整形処理
         auto cleanForClipboard = [](const std::wstring& text) {
             std::wstring res;
             for (wchar_t c : text) {
@@ -1659,7 +1901,80 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             return res;
             };
+
         switch (wParam) {
+        case VK_UP:
+            if (!g_savedFormulas.empty()) {
+                if (g_selectedIndex > 0) {
+                    g_selectedIndex--;
+                }
+                else if (g_selectedIndex == -1) {
+                    g_selectedIndex = (int)g_savedFormulas.size() - 1;
+                }
+                g_inputText = g_savedFormulas[g_selectedIndex].formula;
+                g_resultText = g_savedFormulas[g_selectedIndex].result;
+                g_cursorPos = (int)g_inputText.length();
+                g_selectionStart = g_cursorPos;
+
+                float itemTop = g_selectedIndex * LIST_ITEM_HEIGHT;
+                if (g_scrollOffsetY > itemTop) g_scrollOffsetY = itemTop;
+
+                g_pLayoutTree.reset();
+                g_pResultTree.reset();
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            return 0; // 変更: break ではなく return 0; にして再計算を回避
+
+        case VK_DOWN:
+            if (!g_savedFormulas.empty()) {
+                if (g_selectedIndex < (int)g_savedFormulas.size() - 1) {
+                    g_selectedIndex++;
+                }
+                else if (g_selectedIndex == -1) {
+                    g_selectedIndex = 0;
+                }
+                g_inputText = g_savedFormulas[g_selectedIndex].formula;
+                g_resultText = g_savedFormulas[g_selectedIndex].result;
+                g_cursorPos = (int)g_inputText.length();
+                g_selectionStart = g_cursorPos;
+
+                float itemBottom = (g_selectedIndex + 1) * LIST_ITEM_HEIGHT;
+                if (g_scrollOffsetY + viewHeight < itemBottom) g_scrollOffsetY = itemBottom - viewHeight;
+
+                g_pLayoutTree.reset();
+                g_pResultTree.reset();
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            return 0; // 変更: break ではなく return 0; にして再計算を回避
+
+        case VK_ESCAPE:
+            g_selectedIndex = -1;
+            InvalidateRect(hWnd, nullptr, FALSE);
+            return 0; // 変更
+
+        case VK_DELETE:
+            if (g_selectedIndex != -1) {
+                g_savedFormulas.erase(g_savedFormulas.begin() + g_selectedIndex);
+                SaveFormulasToFile();
+                g_selectedIndex = -1;
+
+                float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
+                g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
+                if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
+
+                InvalidateRect(hWnd, nullptr, FALSE);
+                return 0; // 追加: リスト項目の削除時は再計算を回避
+            }
+            else {
+                if (g_cursorPos != g_selectionStart) {
+                    DeleteSelection();
+                }
+                else if (g_cursorPos < (int)g_inputText.length()) {
+                    g_inputText.erase(g_cursorPos, 1);
+                }
+            }
+            break; // 通常の文字削除時は break して下部の再計算を通す
+
         case VK_RETURN:
             g_resultText = CalculateResult(g_inputText);
             if (!g_resultText.empty()) {
@@ -1668,10 +1983,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pResultTree.reset();
             InvalidateRect(hWnd, nullptr, FALSE);
             break;
+
         case VK_LEFT:
             if (g_cursorPos > 0) g_cursorPos--;
             if (!shiftDown) g_selectionStart = g_cursorPos;
             break;
+
         case VK_RIGHT:
             if (g_cursorPos < (int)g_inputText.length()) {
                 g_cursorPos++;
@@ -1684,14 +2001,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             if (!shiftDown) g_selectionStart = g_cursorPos;
             break;
+
         case VK_HOME:
             g_cursorPos = 0;
             if (!shiftDown) g_selectionStart = g_cursorPos;
             break;
+
         case VK_END:
             g_cursorPos = (int)g_inputText.length();
             if (!shiftDown) g_selectionStart = g_cursorPos;
             break;
+
         case VK_BACK:
             if (g_cursorPos != g_selectionStart) {
                 DeleteSelection();
@@ -1702,14 +2022,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_selectionStart = g_cursorPos;
             }
             break;
-        case VK_DELETE:
-            if (g_cursorPos != g_selectionStart) {
-                DeleteSelection();
-            }
-            else if (g_cursorPos < (int)g_inputText.length()) {
-                g_inputText.erase(g_cursorPos, 1);
-            }
-            break;
+
         case 'R':
             if (ctrlDown) {
                 if (g_cursorPos != g_selectionStart) DeleteSelection();
@@ -1721,6 +2034,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
             break;
+
         case 'A':
             if (ctrlDown) {
                 g_selectionStart = 0;
@@ -1729,6 +2043,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
             break;
+
         case 'C':
             if (ctrlDown) {
                 if (g_cursorPos != g_selectionStart) {
@@ -1754,7 +2069,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     }
                 }
             }
-        break;
+            break;
+
         case 'X':
             if (ctrlDown && g_cursorPos != g_selectionStart) {
                 int startIdx = std::min(g_cursorPos, g_selectionStart);
@@ -1763,17 +2079,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 DeleteSelection();
             }
             break;
+
         case 'V':
             if (ctrlDown) {
                 executePaste();
             }
             break;
+
         case VK_INSERT:
             if (shiftDown) {
                 executePaste();
             }
             break;
         }
+
         g_resultText = CalculateResult(g_inputText);
         g_pResultTree.reset();
         g_pLayoutTree.reset();
@@ -1783,6 +2102,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     break;
     case WM_CHAR:
     {
+        g_selectedIndex = -1;
         wchar_t ch = static_cast<wchar_t>(wParam);
         if (ch >= 32) {
             if (g_cursorPos != g_selectionStart) {
@@ -1835,6 +2155,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         Direct2DContext ctx(g_pRenderTarget.Get(), g_pDWriteFactory.Get());
         D2D1_COLOR_F textColor = g_isDarkMode ? D2D1::ColorF(0xD4D4D4) : D2D1::ColorF(D2D1::ColorF::Black);
         ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
+
+        float startX = 50.0f;
+        float startY = INPUT_AREA_HEIGHT / 2.0f;
+
         if (!g_pLayoutTree) g_pLayoutTree = ParseMathText(g_inputText, &ctx);
         int len = static_cast<int>(g_inputText.length());
         std::vector<CaretMetrics> metrics(len + 1);
@@ -1856,10 +2180,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
         }
         g_caretMetrics = metrics;
-        RECT clientRect;
-        GetClientRect(hWnd, &clientRect);
-        float startX = 50.0f;
-        float startY = (clientRect.bottom - clientRect.top) / 2.0f;
+
         if (g_cursorPos != g_selectionStart) {
             int startIdx = std::min(g_cursorPos, g_selectionStart);
             int endIdx = std::max(g_cursorPos, g_selectionStart);
@@ -1909,6 +2230,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             drawCurrentRect();
         }
         g_pLayoutTree->Draw(&ctx, startX, startY);
+
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
         if (!g_resultText.empty()) {
             if (g_isDarkMode) {
                 ctx.SetTextColor(0.5f, 0.5f, 0.5f);
@@ -1927,9 +2252,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 ctx.DrawGlyph(L"=", resultX, startY, 36.0f, false);
                 resultX += eqW + gap;
             }
-            RECT rc;
-            GetClientRect(hWnd, &rc);
-            float maxResultWidth = rc.right - resultX - 20.0f;
+
+            float btnWidth = 50.0f;
+            float maxResultWidth = rc.right - resultX - btnWidth - 40.0f; // PINボタンの幅を考慮
+
             if (!g_pResultTree) {
                 g_pResultTree = ParseMathText(g_resultText, &ctx);
                 if (g_pResultTree->width > maxResultWidth) {
@@ -1953,8 +2279,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 }
             }
             g_pResultTree->Draw(&ctx, resultX, startY);
+
+            // PINボタン描画
+            float btnHeight = 26.0f;
+            g_pinButtonRect = D2D1::RectF(rc.right - btnWidth - 25.0f, startY - btnHeight / 2.0f, rc.right - 25.0f, startY + btnHeight / 2.0f);
+            ComPtr<ID2D1SolidColorBrush> btnBrush;
+            g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0x444444) : D2D1::ColorF(0xE0E0E0), &btnBrush);
+            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(g_pinButtonRect, 4.0f, 4.0f);
+            g_pRenderTarget->FillRoundedRectangle(&rr, btnBrush.Get());
+
+            ComPtr<ID2D1SolidColorBrush> btnTextBrush;
+            g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0xFFFFFF) : D2D1::ColorF(0x000000), &btnTextBrush);
+            g_pRenderTarget->DrawTextW(L"PIN", 3, g_pUiTextFormat.Get(), g_pinButtonRect, btnTextBrush.Get());
+
             ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
         }
+        else {
+            g_pinButtonRect = { 0,0,0,0 };
+        }
+
         if (g_caretVisible) {
             float caretX = startX + g_caretMetrics[g_cursorPos].x;
             float scale = g_caretMetrics[g_cursorPos].scale;
@@ -1965,6 +2308,97 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             float caretBottom = startY + yOffset + (baseBottom * scale);
             ctx.DrawLine(caretX + 2.0f, caretTop, caretX + 2.0f, caretBottom, 2.0f);
         }
+
+        // 境界線
+        ctx.SetTextColor(0.5f, 0.5f, 0.5f, 0.3f);
+        ctx.DrawLine(20.0f, INPUT_AREA_HEIGHT, rc.right - 20.0f, INPUT_AREA_HEIGHT, 1.0f);
+
+        // 保存リスト表示領域
+        D2D1_RECT_F listClipRect = D2D1::RectF(0.0f, INPUT_AREA_HEIGHT, (float)rc.right, (float)rc.bottom);
+        g_pRenderTarget->PushAxisAlignedClip(listClipRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+        float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
+        float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
+        g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
+        if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
+        if (g_scrollOffsetY < 0.0f) g_scrollOffsetY = 0.0f;
+
+        float listY = INPUT_AREA_HEIGHT - g_scrollOffsetY + (LIST_ITEM_HEIGHT / 2.0f);
+
+        ctx.SetTextColor(textColor.r, textColor.g, textColor.b, 0.8f);
+        int i = 0;
+        for (auto& sf : g_savedFormulas) {
+            if (listY + LIST_ITEM_HEIGHT / 2.0f < INPUT_AREA_HEIGHT || listY - LIST_ITEM_HEIGHT / 2.0f > rc.bottom) {
+                listY += LIST_ITEM_HEIGHT;
+                continue;
+            }
+
+            if (i == g_selectedIndex) {
+                ComPtr<ID2D1SolidColorBrush> highlightBrush;
+                g_pRenderTarget->CreateSolidColorBrush(
+                    g_isDarkMode ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.05f) : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.05f),
+                    &highlightBrush
+                );
+                D2D1_RECT_F rowRect = D2D1::RectF(0, listY - LIST_ITEM_HEIGHT / 2.0f, (float)rc.right, listY + LIST_ITEM_HEIGHT / 2.0f);
+                g_pRenderTarget->FillRectangle(rowRect, highlightBrush.Get());
+            }
+
+            if (!sf.pFormulaTree) sf.pFormulaTree = ParseMathText(sf.formula, &ctx);
+            if (!sf.pResultTree) sf.pResultTree = ParseMathText(sf.result, &ctx);
+
+            float itemStartX = 40.0f;
+            sf.pFormulaTree->Draw(&ctx, itemStartX, listY);
+
+            float gap = 20.0f;
+            float resX = itemStartX + sf.pFormulaTree->width + gap;
+            float eqW, eqH, eqD;
+            ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
+            ctx.DrawGlyph(L"=", resX, listY, 36.0f, false);
+            resX += eqW + gap;
+
+            sf.pResultTree->Draw(&ctx, resX, listY);
+
+            // --- ここから追加 ---
+            // 削除ボタン(×)の描画
+            float delBtnWidth = 24.0f;
+            float delBtnHeight = 24.0f;
+            D2D1_RECT_F delBtnRect = D2D1::RectF((float)rc.right - 60.0f, listY - delBtnHeight / 2.0f, (float)rc.right - 60.0f + delBtnWidth, listY + delBtnHeight / 2.0f);
+
+            ComPtr<ID2D1SolidColorBrush> delBrush;
+            g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0x662222) : D2D1::ColorF(0xFFCCCC), &delBrush);
+            D2D1_ROUNDED_RECT drr = D2D1::RoundedRect(delBtnRect, 4.0f, 4.0f);
+            g_pRenderTarget->FillRoundedRectangle(&drr, delBrush.Get());
+
+            ComPtr<ID2D1SolidColorBrush> delTextBrush;
+            g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0xFF9999) : D2D1::ColorF(0xCC0000), &delTextBrush);
+            g_pRenderTarget->DrawTextW(L"×", 1, g_pUiTextFormat.Get(), delBtnRect, delTextBrush.Get());
+            // --- ここまで追加 ---
+
+            ctx.SetTextColor(0.5f, 0.5f, 0.5f, 0.1f);
+            ctx.DrawLine(40.0f, listY + LIST_ITEM_HEIGHT / 2.0f, rc.right - 40.0f, listY + LIST_ITEM_HEIGHT / 2.0f, 1.0f);
+            ctx.SetTextColor(textColor.r, textColor.g, textColor.b, 0.8f);
+
+            listY += LIST_ITEM_HEIGHT;
+        }
+
+        g_pRenderTarget->PopAxisAlignedClip();
+
+        // カスタムスクロールバーの描画
+        if (g_maxScrollY > 0.0f) {
+            float thumbRatio = viewHeight / contentHeight;
+            float thumbHeight = std::max(30.0f, viewHeight * thumbRatio);
+            float thumbY = INPUT_AREA_HEIGHT + (g_scrollOffsetY / g_maxScrollY) * (viewHeight - thumbHeight);
+            g_scrollbarThumbRect = D2D1::RectF((float)rc.right - 12.0f, thumbY, (float)rc.right - 4.0f, thumbY + thumbHeight);
+
+            ComPtr<ID2D1SolidColorBrush> scrollBrush;
+            g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0.4f, 0.4f, 0.4f, 0.8f) : D2D1::ColorF(0.6f, 0.6f, 0.6f, 0.8f), &scrollBrush);
+            D2D1_ROUNDED_RECT srr = D2D1::RoundedRect(g_scrollbarThumbRect, 4.0f, 4.0f);
+            g_pRenderTarget->FillRoundedRectangle(&srr, scrollBrush.Get());
+        }
+        else {
+            g_scrollbarThumbRect = { 0,0,0,0 };
+        }
+
         g_pRenderTarget->EndDraw();
         EndPaint(hWnd, &ps);
     }
@@ -1988,13 +2422,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         PostQuitMessage(0);
         break;
-	case WM_ERASEBKGND:
+    case WM_ERASEBKGND:
         return 1;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
 }
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     std::wstring cmdLine(lpCmdLine);
     if (false) {
@@ -2003,15 +2438,20 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     }
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_pD2DFactory.GetAddressOf());
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory3), reinterpret_cast<IUnknown**>(g_pDWriteFactory.GetAddressOf()));
+
+    g_pDWriteFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &g_pUiTextFormat);
+    g_pUiTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    g_pUiTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
     WNDCLASSEXW wcex = { sizeof(WNDCLASSEX) };
     wcex.style = CS_HREDRAW | CS_VREDRAW;
     wcex.lpfnWndProc = WndProc;
     wcex.hInstance = hInstance;
-	wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wcex.lpszClassName = L"4mulaWindow";
     RegisterClassExW(&wcex);
-    HWND hWnd = CreateWindowW(L"4mulaWindow", L"4mula", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0, 800, 320, nullptr, nullptr, hInstance, nullptr);
+    HWND hWnd = CreateWindowW(L"4mulaWindow", L"4mula", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0, 800, 480, nullptr, nullptr, hInstance, nullptr);
     if (!hWnd) return FALSE;
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);
