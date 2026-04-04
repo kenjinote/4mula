@@ -37,9 +37,6 @@ std::shared_ptr<Box> g_pResultTree = nullptr;
 bool g_isDragging = false;
 bool g_isDarkMode = false;
 
-// -----------------------------------------------------
-// 追加: 保存リストとUIステート管理
-// -----------------------------------------------------
 struct SavedFormula {
     std::wstring formula;
     std::wstring result;
@@ -47,7 +44,7 @@ struct SavedFormula {
     std::shared_ptr<Box> pResultTree;
 };
 std::vector<SavedFormula> g_savedFormulas;
-int g_selectedIndex = -1; // -1 は何も選択されていない状態
+int g_selectedIndex = -1;
 float g_scrollOffsetY = 0.0f;
 float g_maxScrollY = 0.0f;
 bool g_isDraggingScrollbar = false;
@@ -77,7 +74,7 @@ std::wstring UTF8ToWide(const std::string& str) {
 
 std::wstring GetSaveFilePath() {
     PWSTR path = nullptr;
-    std::wstring result = L"4mula_saved.txt"; // 取得失敗時のフォールバック
+    std::wstring result = L"4mula_saved.txt";
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path))) {
         std::wstring dir = std::wstring(path) + L"\\4mula";
         CreateDirectoryW(dir.c_str(), nullptr);
@@ -134,7 +131,8 @@ struct CaretMetrics {
 };
 std::vector<CaretMetrics> g_caretMetrics;
 extern int g_cursorPos;
-
+float g_inputScale = 1.0f;
+float g_inputStartY = 60.0f;
 class Box {
 public:
     float width = 0.0f;
@@ -544,7 +542,7 @@ public:
 ComPtr<ID2D1Factory7> g_pD2DFactory;
 ComPtr<IDWriteFactory3> g_pDWriteFactory;
 ComPtr<ID2D1HwndRenderTarget> g_pRenderTarget;
-ComPtr<IDWriteTextFormat> g_pUiTextFormat; // 追加
+ComPtr<IDWriteTextFormat> g_pUiTextFormat;
 std::shared_ptr<Box> g_pLayoutTree;
 std::wstring g_inputText = L"";
 int g_cursorPos = 0;
@@ -1557,13 +1555,13 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
 int GetCursorPosFromMouse(HWND hWnd, int mouseX, int mouseY) {
     if (g_caretMetrics.empty()) return 0;
     float startX = 50.0f;
-    float startY = INPUT_AREA_HEIGHT / 2.0f;
+    float startY = g_inputStartY;
     int bestIndex = 0;
     float minDistanceSq = -1.0f;
     for (size_t i = 0; i < g_caretMetrics.size(); ++i) {
         if (g_caretMetrics[i].x < 0.0f) continue;
         float cx = startX + g_caretMetrics[i].x;
-        float cy = startY + g_caretMetrics[i].y - 12.0f;
+        float cy = startY + g_caretMetrics[i].y - 9.0f * g_caretMetrics[i].scale;
         float dx = mouseX - cx;
         float dy = mouseY - cy;
         float distSq = dx * dx + dy * dy * 5.0f;
@@ -1680,7 +1678,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             int xPos = GET_X_LPARAM(lParam);
             int yPos = GET_Y_LPARAM(lParam);
 
-            // ピンボタンの判定
             if (xPos >= g_pinButtonRect.left && xPos <= g_pinButtonRect.right &&
                 yPos >= g_pinButtonRect.top && yPos <= g_pinButtonRect.bottom) {
                 bool isDup = false;
@@ -1699,14 +1696,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     float viewHeight = clientRect.bottom - INPUT_AREA_HEIGHT;
                     float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
                     g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
-                    g_scrollOffsetY = g_maxScrollY; // 一番下へスクロール
+                    g_scrollOffsetY = g_maxScrollY;
 
                     InvalidateRect(hWnd, nullptr, FALSE);
                 }
                 return 0;
             }
 
-            // スクロールバーの判定
             if (xPos >= g_scrollbarThumbRect.left && xPos <= g_scrollbarThumbRect.right &&
                 yPos >= g_scrollbarThumbRect.top && yPos <= g_scrollbarThumbRect.bottom) {
                 g_isDraggingScrollbar = true;
@@ -1716,33 +1712,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
 
-            // リスト領域のクリック判定（ここを変更）
             if (yPos > INPUT_AREA_HEIGHT) {
                 RECT rc;
                 GetClientRect(hWnd, &rc);
 
-                // クリックされたY座標から、スクロールオフセットを考慮してインデックスを計算
                 float listClickY = yPos - INPUT_AREA_HEIGHT + g_scrollOffsetY;
                 int itemIndex = static_cast<int>(listClickY / LIST_ITEM_HEIGHT);
 
                 if (itemIndex >= 0 && itemIndex < g_savedFormulas.size()) {
-                    g_selectedIndex = itemIndex; // 選択インデックスを更新
-                    // 削除ボタンの領域計算
+                    g_selectedIndex = itemIndex;
                     float listY = INPUT_AREA_HEIGHT - g_scrollOffsetY + (itemIndex * LIST_ITEM_HEIGHT) + (LIST_ITEM_HEIGHT / 2.0f);
                     float delBtnWidth = 24.0f;
                     float delBtnHeight = 24.0f;
-                    float delBtnLeft = rc.right - 60.0f; // スクロールバーと被らない位置
+                    float delBtnLeft = rc.right - 60.0f;
                     float delBtnRight = delBtnLeft + delBtnWidth;
                     float delBtnTop = listY - delBtnHeight / 2.0f;
                     float delBtnBottom = listY + delBtnHeight / 2.0f;
 
-                    // 削除ボタンがクリックされたか判定
                     if (xPos >= delBtnLeft && xPos <= delBtnRight && yPos >= delBtnTop && yPos <= delBtnBottom) {
-                        // リストから削除してファイルに保存
                         g_savedFormulas.erase(g_savedFormulas.begin() + itemIndex);
                         SaveFormulasToFile();
 
-                        // アイテムが減ったのでスクロールの最大値を再計算
                         float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
                         float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
                         g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
@@ -1752,7 +1742,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         return 0;
                     }
 
-                    // 削除ボタン以外がクリックされた場合は数式と結果を復元
                     g_inputText = g_savedFormulas[itemIndex].formula;
                     g_resultText = g_savedFormulas[itemIndex].result;
 
@@ -1764,7 +1753,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     g_caretVisible = true;
                     InvalidateRect(hWnd, nullptr, FALSE);
                 }
-                return 0; // カーソル処理を行わずに終了
+                return 0;
             }
 
             int clickPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
@@ -1880,7 +1869,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         RECT rc; GetClientRect(hWnd, &rc);
         float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
 
-        // クリップボードからのペースト処理
         auto executePaste = [&]() {
             std::wstring pastedText = PasteFromClipboard(hWnd);
             if (!pastedText.empty()) {
@@ -1891,7 +1879,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             };
 
-        // クリップボードにコピーする前のテキスト整形処理
         auto cleanForClipboard = [](const std::wstring& text) {
             std::wstring res;
             for (wchar_t c : text) {
@@ -1923,7 +1910,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_pResultTree.reset();
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
-            return 0; // 変更: break ではなく return 0; にして再計算を回避
+            return 0;
 
         case VK_DOWN:
             if (!g_savedFormulas.empty()) {
@@ -1945,12 +1932,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_pResultTree.reset();
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
-            return 0; // 変更: break ではなく return 0; にして再計算を回避
+            return 0;
 
         case VK_ESCAPE:
             g_selectedIndex = -1;
             InvalidateRect(hWnd, nullptr, FALSE);
-            return 0; // 変更
+            return 0;
 
         case VK_DELETE:
             if (g_selectedIndex != -1) {
@@ -1963,7 +1950,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
 
                 InvalidateRect(hWnd, nullptr, FALSE);
-                return 0; // 追加: リスト項目の削除時は再計算を回避
+                return 0;
             }
             else {
                 if (g_cursorPos != g_selectionStart) {
@@ -1973,7 +1960,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     g_inputText.erase(g_cursorPos, 1);
                 }
             }
-            break; // 通常の文字削除時は break して下部の再計算を通す
+            break;
 
         case VK_RETURN:
             g_resultText = CalculateResult(g_inputText);
@@ -2156,10 +2143,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         D2D1_COLOR_F textColor = g_isDarkMode ? D2D1::ColorF(0xD4D4D4) : D2D1::ColorF(D2D1::ColorF::Black);
         ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
 
-        float startX = 50.0f;
-        float startY = INPUT_AREA_HEIGHT / 2.0f;
-
         if (!g_pLayoutTree) g_pLayoutTree = ParseMathText(g_inputText, &ctx);
+
+        g_inputScale = 1.0f;
+        g_inputStartY = INPUT_AREA_HEIGHT / 2.0f;
+        float treeTotalHeight = g_pLayoutTree->height + g_pLayoutTree->depth;
+
+        if (treeTotalHeight > (INPUT_AREA_HEIGHT - 20.0f)) {
+            g_inputScale = (INPUT_AREA_HEIGHT - 20.0f) / treeTotalHeight;
+        }
+
+        float scaledHeight = g_pLayoutTree->height * g_inputScale;
+        float scaledDepth = g_pLayoutTree->depth * g_inputScale;
+
+        if (g_inputStartY - scaledHeight < 10.0f) {
+            g_inputStartY = 10.0f + scaledHeight;
+        }
+        else if (g_inputStartY + scaledDepth > INPUT_AREA_HEIGHT - 10.0f) {
+            g_inputStartY = INPUT_AREA_HEIGHT - 10.0f - scaledDepth;
+        }
+
+        float startX = 50.0f;
+        float startY = g_inputStartY;
+
         int len = static_cast<int>(g_inputText.length());
         std::vector<CaretMetrics> metrics(len + 1);
         g_pLayoutTree->MapCaret(&ctx, 0.0f, 0.0f, 1.0f, false, metrics);
@@ -2178,6 +2184,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 metrics[i].x = metrics[i + 1].x; metrics[i].y = metrics[i + 1].y;
                 metrics[i].scale = metrics[i + 1].scale; metrics[i].isActive = metrics[i + 1].isActive;
             }
+        }
+
+        for (auto& m : metrics) {
+            m.x *= g_inputScale;
+            m.y *= g_inputScale;
+            m.scale *= g_inputScale;
         }
         g_caretMetrics = metrics;
 
@@ -2229,6 +2241,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             drawCurrentRect();
         }
+
+        D2D1_MATRIX_3X2_F oldTr;
+        g_pRenderTarget->GetTransform(&oldTr);
+        g_pRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(g_inputScale, g_inputScale, D2D1::Point2F(startX, startY)) * oldTr);
+
         g_pLayoutTree->Draw(&ctx, startX, startY);
 
         RECT rc;
@@ -2254,7 +2271,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
 
             float btnWidth = 50.0f;
-            float maxResultWidth = rc.right - resultX - btnWidth - 40.0f; // PINボタンの幅を考慮
+            float screenResultX = startX + (resultX - startX) * g_inputScale;
+            float maxResultWidthScreen = rc.right - screenResultX - btnWidth - 40.0f;
+            float maxResultWidth = maxResultWidthScreen / g_inputScale;
 
             if (!g_pResultTree) {
                 g_pResultTree = ParseMathText(g_resultText, &ctx);
@@ -2279,8 +2298,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 }
             }
             g_pResultTree->Draw(&ctx, resultX, startY);
+        }
 
-            // PINボタン描画
+        g_pRenderTarget->SetTransform(oldTr);
+        ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
+
+        if (!g_resultText.empty()) {
+            float btnWidth = 50.0f;
             float btnHeight = 26.0f;
             g_pinButtonRect = D2D1::RectF(rc.right - btnWidth - 25.0f, startY - btnHeight / 2.0f, rc.right - 25.0f, startY + btnHeight / 2.0f);
             ComPtr<ID2D1SolidColorBrush> btnBrush;
@@ -2291,8 +2315,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ComPtr<ID2D1SolidColorBrush> btnTextBrush;
             g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0xFFFFFF) : D2D1::ColorF(0x000000), &btnTextBrush);
             g_pRenderTarget->DrawTextW(L"PIN", 3, g_pUiTextFormat.Get(), g_pinButtonRect, btnTextBrush.Get());
-
-            ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
         }
         else {
             g_pinButtonRect = { 0,0,0,0 };
@@ -2309,11 +2331,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ctx.DrawLine(caretX + 2.0f, caretTop, caretX + 2.0f, caretBottom, 2.0f);
         }
 
-        // 境界線
         ctx.SetTextColor(0.5f, 0.5f, 0.5f, 0.3f);
         ctx.DrawLine(20.0f, INPUT_AREA_HEIGHT, rc.right - 20.0f, INPUT_AREA_HEIGHT, 1.0f);
 
-        // 保存リスト表示領域
         D2D1_RECT_F listClipRect = D2D1::RectF(0.0f, INPUT_AREA_HEIGHT, (float)rc.right, (float)rc.bottom);
         g_pRenderTarget->PushAxisAlignedClip(listClipRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
@@ -2330,6 +2350,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         for (auto& sf : g_savedFormulas) {
             if (listY + LIST_ITEM_HEIGHT / 2.0f < INPUT_AREA_HEIGHT || listY - LIST_ITEM_HEIGHT / 2.0f > rc.bottom) {
                 listY += LIST_ITEM_HEIGHT;
+                i++;
                 continue;
             }
 
@@ -2346,7 +2367,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (!sf.pFormulaTree) sf.pFormulaTree = ParseMathText(sf.formula, &ctx);
             if (!sf.pResultTree) sf.pResultTree = ParseMathText(sf.result, &ctx);
 
+            float itemScale = 1.0f;
+            float maxItemHeight = LIST_ITEM_HEIGHT - 20.0f;
+            float treeH = sf.pFormulaTree->height + sf.pFormulaTree->depth;
+            float resH = sf.pResultTree->height + sf.pResultTree->depth;
+            float maxH = std::max(treeH, resH);
+
+            if (maxH > maxItemHeight) {
+                itemScale = maxItemHeight / maxH;
+            }
+
             float itemStartX = 40.0f;
+
+            D2D1_MATRIX_3X2_F oldListTr;
+            g_pRenderTarget->GetTransform(&oldListTr);
+            g_pRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(itemScale, itemScale, D2D1::Point2F(itemStartX, listY)) * oldListTr);
+
             sf.pFormulaTree->Draw(&ctx, itemStartX, listY);
 
             float gap = 20.0f;
@@ -2358,8 +2394,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             sf.pResultTree->Draw(&ctx, resX, listY);
 
-            // --- ここから追加 ---
-            // 削除ボタン(×)の描画
+            g_pRenderTarget->SetTransform(oldListTr);
+
             float delBtnWidth = 24.0f;
             float delBtnHeight = 24.0f;
             D2D1_RECT_F delBtnRect = D2D1::RectF((float)rc.right - 60.0f, listY - delBtnHeight / 2.0f, (float)rc.right - 60.0f + delBtnWidth, listY + delBtnHeight / 2.0f);
@@ -2372,18 +2408,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ComPtr<ID2D1SolidColorBrush> delTextBrush;
             g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0xFF9999) : D2D1::ColorF(0xCC0000), &delTextBrush);
             g_pRenderTarget->DrawTextW(L"×", 1, g_pUiTextFormat.Get(), delBtnRect, delTextBrush.Get());
-            // --- ここまで追加 ---
 
             ctx.SetTextColor(0.5f, 0.5f, 0.5f, 0.1f);
             ctx.DrawLine(40.0f, listY + LIST_ITEM_HEIGHT / 2.0f, rc.right - 40.0f, listY + LIST_ITEM_HEIGHT / 2.0f, 1.0f);
             ctx.SetTextColor(textColor.r, textColor.g, textColor.b, 0.8f);
 
             listY += LIST_ITEM_HEIGHT;
+            i++;
         }
 
         g_pRenderTarget->PopAxisAlignedClip();
 
-        // カスタムスクロールバーの描画
         if (g_maxScrollY > 0.0f) {
             float thumbRatio = viewHeight / contentHeight;
             float thumbHeight = std::max(30.0f, viewHeight * thumbRatio);
