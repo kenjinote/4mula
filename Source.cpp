@@ -129,10 +129,19 @@ struct CaretMetrics {
     float scale = 1.0f;
     bool isActive = false;
 };
+
 std::vector<CaretMetrics> g_caretMetrics;
-extern int g_cursorPos;
+std::vector<CaretMetrics> g_resultCaretMetrics;
+
+int g_cursorPos = 0;
+int g_selectionStart = 0;
+int g_resultCursorPos = 0;
+int g_resultSelectionStart = 0;
+bool g_isResultFocused = false;
+
 float g_inputScale = 1.0f;
 float g_inputStartY = 60.0f;
+
 class Box {
 public:
     float width = 0.0f;
@@ -475,6 +484,7 @@ class Direct2DContext : public IMathRendererContext {
     ComPtr<IDWriteFactory3> m_pDWriteFactory;
     ComPtr<IDWriteTextFormat> m_pFormatNormal;
     ComPtr<IDWriteTextFormat> m_pFormatItalic;
+    ComPtr<IDWriteTextFormat> m_pFormatIcon;
     ComPtr<ID2D1SolidColorBrush> m_pBrush;
 public:
     Direct2DContext(ID2D1RenderTarget* pRT, IDWriteFactory3* pDWriteFactory)
@@ -484,6 +494,8 @@ public:
             DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 32.0f, L"en-us", &m_pFormatNormal);
         m_pDWriteFactory->CreateTextFormat(L"Cambria", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STRETCH_NORMAL, 32.0f, L"en-us", &m_pFormatItalic);
+        m_pDWriteFactory->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 32.0f, L"en-us", &m_pFormatIcon);
     }
     void MeasureGlyph(const std::wstring& text, float fontSize, bool isItalic, float& outWidth, float& outHeight, float& outDepth) override {
         ComPtr<IDWriteTextLayout> pLayout;
@@ -537,6 +549,30 @@ public:
     void SetTextColor(float r, float g, float b, float a = 1.0f) override {
         m_pBrush->SetColor(D2D1::ColorF(r, g, b, a));
     }
+    void MeasureIcon(const std::wstring& text, float fontSize, float& outWidth, float& outHeight, float& outDepth) {
+        ComPtr<IDWriteTextLayout> pLayout;
+        m_pDWriteFactory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.length()), m_pFormatIcon.Get(), 10000.0f, 10000.0f, &pLayout);
+        DWRITE_TEXT_RANGE range = { 0, static_cast<UINT32>(text.length()) };
+        pLayout->SetFontSize(fontSize, range);
+        DWRITE_TEXT_METRICS metrics;
+        pLayout->GetMetrics(&metrics);
+        outWidth = metrics.widthIncludingTrailingWhitespace;
+        DWRITE_LINE_METRICS lineMetrics;
+        UINT32 actualLineCount;
+        pLayout->GetLineMetrics(&lineMetrics, 1, &actualLineCount);
+        outHeight = lineMetrics.baseline;
+        outDepth = lineMetrics.height - lineMetrics.baseline;
+    }
+    void DrawIcon(const std::wstring& text, float x, float y, float fontSize) {
+        ComPtr<IDWriteTextLayout> pLayout;
+        m_pDWriteFactory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.length()), m_pFormatIcon.Get(), 10000.0f, 10000.0f, &pLayout);
+        DWRITE_TEXT_RANGE range = { 0, static_cast<UINT32>(text.length()) };
+        pLayout->SetFontSize(fontSize, range);
+        DWRITE_LINE_METRICS lineMetrics;
+        UINT32 actualLineCount;
+        pLayout->GetLineMetrics(&lineMetrics, 1, &actualLineCount);
+        m_pRT->DrawTextLayout(D2D1::Point2F(x, y - lineMetrics.baseline), pLayout.Get(), m_pBrush.Get());
+    }
 };
 
 ComPtr<ID2D1Factory7> g_pD2DFactory;
@@ -545,8 +581,6 @@ ComPtr<ID2D1HwndRenderTarget> g_pRenderTarget;
 ComPtr<IDWriteTextFormat> g_pUiTextFormat;
 std::shared_ptr<Box> g_pLayoutTree;
 std::wstring g_inputText = L"";
-int g_cursorPos = 0;
-int g_selectionStart = 0;
 bool g_caretVisible = true;
 const UINT CARET_TIMER_ID = 1;
 const UINT DEMO_TYPING_TIMER_ID = 2;
@@ -579,13 +613,31 @@ void InitDemoFormulas() {
     };
 }
 
+std::wstring& ActiveText() {
+    if (g_selectedIndex >= 0 && g_selectedIndex < g_savedFormulas.size()) return g_savedFormulas[g_selectedIndex].formula;
+    return g_inputText;
+}
+std::wstring& ActiveResult() {
+    if (g_selectedIndex >= 0 && g_selectedIndex < g_savedFormulas.size()) return g_savedFormulas[g_selectedIndex].result;
+    return g_resultText;
+}
+std::shared_ptr<Box>& ActiveLayoutTree() {
+    if (g_selectedIndex >= 0 && g_selectedIndex < g_savedFormulas.size()) return g_savedFormulas[g_selectedIndex].pFormulaTree;
+    return g_pLayoutTree;
+}
+std::shared_ptr<Box>& ActiveResultTree() {
+    if (g_selectedIndex >= 0 && g_selectedIndex < g_savedFormulas.size()) return g_savedFormulas[g_selectedIndex].pResultTree;
+    return g_pResultTree;
+}
+
 void DeleteSelection() {
     if (g_cursorPos == g_selectionStart) return;
     int startIdx = std::min(g_cursorPos, g_selectionStart);
     int endIdx = std::max(g_cursorPos, g_selectionStart);
-    g_inputText.erase(startIdx, endIdx - startIdx);
+    ActiveText().erase(startIdx, endIdx - startIdx);
     g_cursorPos = startIdx;
     g_selectionStart = startIdx;
+    if (g_selectedIndex >= 0) SaveFormulasToFile();
 }
 
 void CopyToClipboard(HWND hWnd, const std::wstring& text) {
@@ -1186,7 +1238,7 @@ std::wstring CalculateResult(std::wstring text) {
     std::wstring cleanText = text;
     cleanText.erase(std::remove(cleanText.begin(), cleanText.end(), L' '), cleanText.end());
     if (cleanText == L"version") {
-        return L"v1.0.5";
+        return L"v1.0.6";
     }
     if (text.empty()) return L"";
     if (text.find(L'=') != std::wstring::npos) return L"";
@@ -1552,16 +1604,17 @@ std::shared_ptr<Box> ParseMathText(const std::wstring& text, IMathRendererContex
     return root;
 }
 
-int GetCursorPosFromMouse(HWND hWnd, int mouseX, int mouseY) {
-    if (g_caretMetrics.empty()) return 0;
-    float startX = 50.0f;
-    float startY = g_inputStartY;
+int GetCursorPosFromMouse(const std::vector<CaretMetrics>& metrics, int mouseX, int mouseY, float& outMinDistSq) {
+    if (metrics.empty()) {
+        outMinDistSq = -1.0f;
+        return 0;
+    }
     int bestIndex = 0;
     float minDistanceSq = -1.0f;
-    for (size_t i = 0; i < g_caretMetrics.size(); ++i) {
-        if (g_caretMetrics[i].x < 0.0f) continue;
-        float cx = startX + g_caretMetrics[i].x;
-        float cy = startY + g_caretMetrics[i].y - 9.0f * g_caretMetrics[i].scale;
+    for (size_t i = 0; i < metrics.size(); ++i) {
+        if (metrics[i].x < 0.0f && metrics[i].y == 0.0f) continue;
+        float cx = metrics[i].x;
+        float cy = metrics[i].y - 9.0f * metrics[i].scale;
         float dx = mouseX - cx;
         float dy = mouseY - cy;
         float distSq = dx * dx + dy * dy * 5.0f;
@@ -1570,6 +1623,7 @@ int GetCursorPosFromMouse(HWND hWnd, int mouseX, int mouseY) {
             bestIndex = static_cast<int>(i);
         }
     }
+    outMinDistSq = minDistanceSq;
     return bestIndex;
 }
 
@@ -1628,6 +1682,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_resultText = CalculateResult(g_inputText);
                 g_pResultTree.reset();
                 g_pLayoutTree.reset();
+                g_resultCursorPos = 0;
+                g_resultSelectionStart = 0;
                 g_caretVisible = true;
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
@@ -1662,6 +1718,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_resultText = L"";
                 g_pResultTree.reset();
                 g_pLayoutTree.reset();
+                g_resultCursorPos = 0;
+                g_resultSelectionStart = 0;
                 InvalidateRect(hWnd, nullptr, FALSE);
                 SetTimer(hWnd, DEMO_TYPING_TIMER_ID, 50, nullptr);
             }
@@ -1678,17 +1736,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             int xPos = GET_X_LPARAM(lParam);
             int yPos = GET_Y_LPARAM(lParam);
 
-            if (xPos >= g_pinButtonRect.left && xPos <= g_pinButtonRect.right &&
+            if (g_selectedIndex == -1 && xPos >= g_pinButtonRect.left && xPos <= g_pinButtonRect.right &&
                 yPos >= g_pinButtonRect.top && yPos <= g_pinButtonRect.bottom) {
                 bool isDup = false;
                 for (auto& f : g_savedFormulas) {
-                    if (f.formula == g_inputText) { isDup = true; break; }
+                    if (f.formula == ActiveText()) { isDup = true; break; }
                 }
-                if (!isDup && !g_inputText.empty() && !g_resultText.empty()) {
+                if (!isDup && !ActiveText().empty() && !ActiveResult().empty()) {
                     SavedFormula sf;
-                    sf.formula = g_inputText;
-                    sf.result = g_resultText;
-                    g_savedFormulas.push_back(sf);
+                    sf.formula = ActiveText();
+                    sf.result = ActiveResult();
+                    g_savedFormulas.insert(g_savedFormulas.begin(), sf);
                     SaveFormulasToFile();
 
                     RECT clientRect;
@@ -1696,7 +1754,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     float viewHeight = clientRect.bottom - INPUT_AREA_HEIGHT;
                     float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
                     g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
-                    g_scrollOffsetY = g_maxScrollY;
+                    g_scrollOffsetY = 0.0f;
 
                     InvalidateRect(hWnd, nullptr, FALSE);
                 }
@@ -1712,15 +1770,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
 
+            bool changedSelection = false;
             if (yPos > INPUT_AREA_HEIGHT) {
                 RECT rc;
                 GetClientRect(hWnd, &rc);
-
                 float listClickY = yPos - INPUT_AREA_HEIGHT + g_scrollOffsetY;
                 int itemIndex = static_cast<int>(listClickY / LIST_ITEM_HEIGHT);
 
                 if (itemIndex >= 0 && itemIndex < g_savedFormulas.size()) {
-                    g_selectedIndex = itemIndex;
                     float listY = INPUT_AREA_HEIGHT - g_scrollOffsetY + (itemIndex * LIST_ITEM_HEIGHT) + (LIST_ITEM_HEIGHT / 2.0f);
                     float delBtnWidth = 24.0f;
                     float delBtnHeight = 24.0f;
@@ -1733,6 +1790,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         g_savedFormulas.erase(g_savedFormulas.begin() + itemIndex);
                         SaveFormulasToFile();
 
+                        if (g_selectedIndex == itemIndex) g_selectedIndex = -1;
+                        else if (g_selectedIndex > itemIndex) g_selectedIndex--;
+
                         float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
                         float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
                         g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
@@ -1742,68 +1802,53 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         return 0;
                     }
 
-                    g_inputText = g_savedFormulas[itemIndex].formula;
-                    g_resultText = g_savedFormulas[itemIndex].result;
-
-                    g_cursorPos = static_cast<int>(g_inputText.length());
-                    g_selectionStart = g_cursorPos;
-
-                    g_pLayoutTree.reset();
-                    g_pResultTree.reset();
-                    g_caretVisible = true;
-                    InvalidateRect(hWnd, nullptr, FALSE);
-                }
-                return 0;
-            }
-
-            int clickPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
-            if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) {
-                int selStart = std::min(g_cursorPos, g_selectionStart);
-                int selEnd = std::max(g_cursorPos, g_selectionStart);
-                if (selStart != selEnd && clickPos >= selStart && clickPos <= selEnd) {
-                    g_cursorPos = clickPos;
-                    g_selectionStart = clickPos;
-                }
-                else if (g_inputText.empty()) {
-                    g_cursorPos = 0;
-                    g_selectionStart = 0;
+                    if (g_selectedIndex != itemIndex) {
+                        g_selectedIndex = itemIndex;
+                        changedSelection = true;
+                    }
                 }
                 else {
-                    auto isWordChar = [](wchar_t c) {
-                        return iswdigit(c) || iswalpha(c) || c == L'.';
-                        };
-                    int leftIdx = clickPos;
-                    int rightIdx = clickPos;
-                    bool isInsideWord = false;
-                    if (clickPos < g_inputText.length() && isWordChar(g_inputText[clickPos])) {
-                        isInsideWord = true;
+                    if (g_selectedIndex != -1) {
+                        g_selectedIndex = -1;
+                        changedSelection = true;
                     }
-                    else if (clickPos > 0 && isWordChar(g_inputText[clickPos - 1])) {
-                        isInsideWord = true;
-                    }
-                    if (isInsideWord) {
-                        while (leftIdx > 0 && isWordChar(g_inputText[leftIdx - 1])) {
-                            leftIdx--;
-                        }
-                        while (rightIdx < g_inputText.length() && isWordChar(g_inputText[rightIdx])) {
-                            rightIdx++;
-                        }
-                    }
-                    else {
-                        if (clickPos < g_inputText.length()) {
-                            rightIdx = clickPos + 1;
-                        }
-                        else if (clickPos > 0) {
-                            leftIdx = clickPos - 1;
-                        }
-                    }
-                    g_selectionStart = leftIdx;
-                    g_cursorPos = rightIdx;
                 }
             }
             else {
-                g_cursorPos = clickPos;
+                if (g_selectedIndex != -1) {
+                    g_selectedIndex = -1;
+                    changedSelection = true;
+                }
             }
+
+            bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+            if (changedSelection) {
+                shiftDown = false;
+                InvalidateRect(hWnd, nullptr, FALSE);
+                UpdateWindow(hWnd);
+            }
+
+            float fDist = -1.0f, rDist = -1.0f;
+            int fPos = GetCursorPosFromMouse(g_caretMetrics, xPos, yPos, fDist);
+            int rPos = GetCursorPosFromMouse(g_resultCaretMetrics, xPos, yPos, rDist);
+
+            bool clickedResult = false;
+            if (rDist >= 0.0f && (fDist < 0.0f || rDist < fDist) && !ActiveResult().empty()) {
+                clickedResult = true;
+            }
+
+            if (clickedResult) {
+                g_isResultFocused = true;
+                if (!shiftDown || changedSelection) g_resultSelectionStart = rPos;
+                g_resultCursorPos = rPos;
+            }
+            else {
+                g_isResultFocused = false;
+                if (!shiftDown || changedSelection) g_selectionStart = fPos;
+                g_cursorPos = fPos;
+            }
+
             SetCapture(hWnd);
             g_isDragging = true;
             g_caretVisible = true;
@@ -1831,11 +1876,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         if (g_isDragging) {
             int xPos = GET_X_LPARAM(lParam);
-            int newPos = GetCursorPosFromMouse(hWnd, xPos, yPos);
-            if (g_cursorPos != newPos) {
-                g_cursorPos = newPos;
-                g_caretVisible = true;
-                InvalidateRect(hWnd, nullptr, FALSE);
+            float fDist = -1.0f, rDist = -1.0f;
+            int fPos = GetCursorPosFromMouse(g_caretMetrics, xPos, yPos, fDist);
+            int rPos = GetCursorPosFromMouse(g_resultCaretMetrics, xPos, yPos, rDist);
+
+            if (g_isResultFocused) {
+                if (g_resultCursorPos != rPos) {
+                    g_resultCursorPos = rPos;
+                    g_caretVisible = true;
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                }
+            }
+            else {
+                if (g_cursorPos != fPos) {
+                    g_cursorPos = fPos;
+                    g_caretVisible = true;
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                }
             }
         }
     }
@@ -1868,12 +1925,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         RECT rc; GetClientRect(hWnd, &rc);
         float viewHeight = rc.bottom - INPUT_AREA_HEIGHT;
+        std::wstring oldText = ActiveText();
 
         auto executePaste = [&]() {
+            if (g_isResultFocused) {
+                g_isResultFocused = false;
+                g_cursorPos = static_cast<int>(ActiveText().length());
+                g_selectionStart = g_cursorPos;
+            }
             std::wstring pastedText = PasteFromClipboard(hWnd);
             if (!pastedText.empty()) {
                 if (g_cursorPos != g_selectionStart) DeleteSelection();
-                g_inputText.insert(g_cursorPos, pastedText);
+                ActiveText().insert(g_cursorPos, pastedText);
                 g_cursorPos += static_cast<int>(pastedText.length());
                 g_selectionStart = g_cursorPos;
             }
@@ -1895,116 +1958,157 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 if (g_selectedIndex > 0) {
                     g_selectedIndex--;
                 }
+                else if (g_selectedIndex == 0) {
+                    g_selectedIndex = -1;
+                }
                 else if (g_selectedIndex == -1) {
                     g_selectedIndex = (int)g_savedFormulas.size() - 1;
                 }
-                g_inputText = g_savedFormulas[g_selectedIndex].formula;
-                g_resultText = g_savedFormulas[g_selectedIndex].result;
-                g_cursorPos = (int)g_inputText.length();
+
+                g_isResultFocused = false;
+                g_cursorPos = (int)ActiveText().length();
                 g_selectionStart = g_cursorPos;
+                g_resultCursorPos = 0;
+                g_resultSelectionStart = 0;
 
-                float itemTop = g_selectedIndex * LIST_ITEM_HEIGHT;
-                if (g_scrollOffsetY > itemTop) g_scrollOffsetY = itemTop;
-
-                g_pLayoutTree.reset();
-                g_pResultTree.reset();
+                if (g_selectedIndex >= 0) {
+                    float itemTop = g_selectedIndex * LIST_ITEM_HEIGHT;
+                    if (g_scrollOffsetY > itemTop) g_scrollOffsetY = itemTop;
+                }
+                else {
+                    g_scrollOffsetY = 0.0f;
+                }
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
             return 0;
 
         case VK_DOWN:
             if (!g_savedFormulas.empty()) {
-                if (g_selectedIndex < (int)g_savedFormulas.size() - 1) {
-                    g_selectedIndex++;
-                }
-                else if (g_selectedIndex == -1) {
+                if (g_selectedIndex == -1) {
                     g_selectedIndex = 0;
                 }
-                g_inputText = g_savedFormulas[g_selectedIndex].formula;
-                g_resultText = g_savedFormulas[g_selectedIndex].result;
-                g_cursorPos = (int)g_inputText.length();
+                else if (g_selectedIndex < (int)g_savedFormulas.size() - 1) {
+                    g_selectedIndex++;
+                }
+
+                g_isResultFocused = false;
+                g_cursorPos = (int)ActiveText().length();
                 g_selectionStart = g_cursorPos;
+                g_resultCursorPos = 0;
+                g_resultSelectionStart = 0;
 
-                float itemBottom = (g_selectedIndex + 1) * LIST_ITEM_HEIGHT;
-                if (g_scrollOffsetY + viewHeight < itemBottom) g_scrollOffsetY = itemBottom - viewHeight;
-
-                g_pLayoutTree.reset();
-                g_pResultTree.reset();
+                if (g_selectedIndex >= 0) {
+                    float itemBottom = (g_selectedIndex + 1) * LIST_ITEM_HEIGHT;
+                    if (g_scrollOffsetY + viewHeight < itemBottom) g_scrollOffsetY = itemBottom - viewHeight;
+                }
                 InvalidateRect(hWnd, nullptr, FALSE);
             }
             return 0;
 
         case VK_ESCAPE:
             g_selectedIndex = -1;
+            g_isResultFocused = false;
+            g_cursorPos = (int)ActiveText().length();
+            g_selectionStart = g_cursorPos;
+            g_resultCursorPos = 0;
+            g_resultSelectionStart = 0;
             InvalidateRect(hWnd, nullptr, FALSE);
             return 0;
 
         case VK_DELETE:
-            if (g_selectedIndex != -1) {
-                g_savedFormulas.erase(g_savedFormulas.begin() + g_selectedIndex);
-                SaveFormulasToFile();
-                g_selectedIndex = -1;
-
-                float contentHeight = g_savedFormulas.size() * LIST_ITEM_HEIGHT;
-                g_maxScrollY = std::max(0.0f, contentHeight - viewHeight);
-                if (g_scrollOffsetY > g_maxScrollY) g_scrollOffsetY = g_maxScrollY;
-
-                InvalidateRect(hWnd, nullptr, FALSE);
-                return 0;
+            if (g_isResultFocused) return 0;
+            if (g_cursorPos != g_selectionStart) {
+                DeleteSelection();
             }
-            else {
-                if (g_cursorPos != g_selectionStart) {
-                    DeleteSelection();
-                }
-                else if (g_cursorPos < (int)g_inputText.length()) {
-                    g_inputText.erase(g_cursorPos, 1);
-                }
+            else if (g_cursorPos < (int)ActiveText().length()) {
+                ActiveText().erase(g_cursorPos, 1);
             }
             break;
 
         case VK_RETURN:
-            g_resultText = CalculateResult(g_inputText);
-            if (!g_resultText.empty()) {
-                CopyToClipboard(hWnd, cleanForClipboard(g_resultText));
+            ActiveResult() = CalculateResult(ActiveText());
+            if (!ActiveResult().empty()) {
+                CopyToClipboard(hWnd, cleanForClipboard(ActiveResult()));
             }
-            g_pResultTree.reset();
+            ActiveResultTree().reset();
+            if (g_selectedIndex >= 0) SaveFormulasToFile();
             InvalidateRect(hWnd, nullptr, FALSE);
-            break;
+            return 0;
 
         case VK_LEFT:
-            if (g_cursorPos > 0) g_cursorPos--;
-            if (!shiftDown) g_selectionStart = g_cursorPos;
+            if (g_isResultFocused) {
+                if (g_resultCursorPos > 0) {
+                    g_resultCursorPos--;
+                    if (!shiftDown) g_resultSelectionStart = g_resultCursorPos;
+                }
+                else if (!shiftDown) {
+                    g_isResultFocused = false;
+                    g_cursorPos = (int)ActiveText().length();
+                    g_selectionStart = g_cursorPos;
+                }
+            }
+            else {
+                if (g_cursorPos > 0) g_cursorPos--;
+                if (!shiftDown) g_selectionStart = g_cursorPos;
+            }
             break;
 
         case VK_RIGHT:
-            if (g_cursorPos < (int)g_inputText.length()) {
-                g_cursorPos++;
+            if (g_isResultFocused) {
+                if (g_resultCursorPos < (int)ActiveResult().length()) {
+                    g_resultCursorPos++;
+                }
+                if (!shiftDown) g_resultSelectionStart = g_resultCursorPos;
             }
             else {
-                if (!g_caretMetrics.empty() && g_caretMetrics[g_cursorPos].isActive) {
-                    g_inputText.insert(g_cursorPos, 1, L'\x200B');
+                if (g_cursorPos < (int)ActiveText().length()) {
                     g_cursorPos++;
+                    if (!shiftDown) g_selectionStart = g_cursorPos;
+                }
+                else {
+                    if (!ActiveResult().empty() && !shiftDown) {
+                        g_isResultFocused = true;
+                        g_resultCursorPos = 0;
+                        g_resultSelectionStart = 0;
+                    }
+                    else if (!g_caretMetrics.empty() && g_cursorPos < g_caretMetrics.size() && g_caretMetrics[g_cursorPos].isActive) {
+                        ActiveText().insert(g_cursorPos, 1, L'\x200B');
+                        g_cursorPos++;
+                        if (!shiftDown) g_selectionStart = g_cursorPos;
+                    }
                 }
             }
-            if (!shiftDown) g_selectionStart = g_cursorPos;
             break;
 
         case VK_HOME:
-            g_cursorPos = 0;
-            if (!shiftDown) g_selectionStart = g_cursorPos;
+            if (g_isResultFocused) {
+                g_resultCursorPos = 0;
+                if (!shiftDown) g_resultSelectionStart = g_resultCursorPos;
+            }
+            else {
+                g_cursorPos = 0;
+                if (!shiftDown) g_selectionStart = g_cursorPos;
+            }
             break;
 
         case VK_END:
-            g_cursorPos = (int)g_inputText.length();
-            if (!shiftDown) g_selectionStart = g_cursorPos;
+            if (g_isResultFocused) {
+                g_resultCursorPos = (int)ActiveResult().length();
+                if (!shiftDown) g_resultSelectionStart = g_resultCursorPos;
+            }
+            else {
+                g_cursorPos = (int)ActiveText().length();
+                if (!shiftDown) g_selectionStart = g_cursorPos;
+            }
             break;
 
         case VK_BACK:
+            if (g_isResultFocused) return 0;
             if (g_cursorPos != g_selectionStart) {
                 DeleteSelection();
             }
             else if (g_cursorPos > 0) {
-                g_inputText.erase(g_cursorPos - 1, 1);
+                ActiveText().erase(g_cursorPos - 1, 1);
                 g_cursorPos--;
                 g_selectionStart = g_cursorPos;
             }
@@ -2012,58 +2116,87 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         case 'R':
             if (ctrlDown) {
+                if (g_isResultFocused) {
+                    g_isResultFocused = false;
+                    g_cursorPos = static_cast<int>(ActiveText().length());
+                    g_selectionStart = g_cursorPos;
+                }
                 if (g_cursorPos != g_selectionStart) DeleteSelection();
-                g_inputText.insert(g_cursorPos, L"√");
+                ActiveText().insert(g_cursorPos, L"√");
                 g_cursorPos++;
                 g_selectionStart = g_cursorPos;
-                g_pLayoutTree.reset();
-                g_caretVisible = true;
-                InvalidateRect(hWnd, nullptr, FALSE);
             }
             break;
 
         case 'A':
             if (ctrlDown) {
-                g_selectionStart = 0;
-                g_cursorPos = static_cast<int>(g_inputText.length());
-                g_caretVisible = true;
-                InvalidateRect(hWnd, nullptr, FALSE);
+                if (g_isResultFocused) {
+                    g_resultSelectionStart = 0;
+                    g_resultCursorPos = static_cast<int>(ActiveResult().length());
+                }
+                else {
+                    g_selectionStart = 0;
+                    g_cursorPos = static_cast<int>(ActiveText().length());
+                }
             }
             break;
 
         case 'C':
             if (ctrlDown) {
-                if (g_cursorPos != g_selectionStart) {
-                    int startIdx = std::min(g_cursorPos, g_selectionStart);
-                    int endIdx = std::max(g_cursorPos, g_selectionStart);
-                    CopyToClipboard(hWnd, cleanForClipboard(g_inputText.substr(startIdx, endIdx - startIdx)));
-                }
-                else if (!g_inputText.empty()) {
-                    std::wstring formula = cleanForClipboard(g_inputText);
-                    if (!g_resultText.empty()) {
-                        std::wstring ans = cleanForClipboard(g_resultText);
-                        std::wstring copyText;
-                        if (ans == L"is prime") {
-                            copyText = formula + L" " + ans;
-                        }
-                        else {
-                            copyText = formula + L" = " + ans;
-                        }
-                        CopyToClipboard(hWnd, copyText);
+                if (g_isResultFocused) {
+                    if (g_resultCursorPos != g_resultSelectionStart) {
+                        int startIdx = std::min(g_resultCursorPos, g_resultSelectionStart);
+                        int endIdx = std::max(g_resultCursorPos, g_resultSelectionStart);
+                        CopyToClipboard(hWnd, cleanForClipboard(ActiveResult().substr(startIdx, endIdx - startIdx)));
                     }
                     else {
-                        CopyToClipboard(hWnd, formula);
+                        CopyToClipboard(hWnd, cleanForClipboard(ActiveResult()));
+                    }
+                }
+                else {
+                    if (g_cursorPos != g_selectionStart) {
+                        int startIdx = std::min(g_cursorPos, g_selectionStart);
+                        int endIdx = std::max(g_cursorPos, g_selectionStart);
+                        CopyToClipboard(hWnd, cleanForClipboard(ActiveText().substr(startIdx, endIdx - startIdx)));
+                    }
+                    else if (!ActiveText().empty()) {
+                        std::wstring formula = cleanForClipboard(ActiveText());
+                        if (!ActiveResult().empty()) {
+                            std::wstring ans = cleanForClipboard(ActiveResult());
+                            std::wstring copyText;
+                            if (ans == L"is prime") {
+                                copyText = formula + L" " + ans;
+                            }
+                            else {
+                                copyText = formula + L" = " + ans;
+                            }
+                            CopyToClipboard(hWnd, copyText);
+                        }
+                        else {
+                            CopyToClipboard(hWnd, formula);
+                        }
                     }
                 }
             }
             break;
 
         case 'X':
-            if (ctrlDown && g_cursorPos != g_selectionStart) {
-                int startIdx = std::min(g_cursorPos, g_selectionStart);
-                int endIdx = std::max(g_cursorPos, g_selectionStart);
-                CopyToClipboard(hWnd, g_inputText.substr(startIdx, endIdx - startIdx));
-                DeleteSelection();
+            if (ctrlDown) {
+                if (g_isResultFocused) {
+                    if (g_resultCursorPos != g_resultSelectionStart) {
+                        int startIdx = std::min(g_resultCursorPos, g_resultSelectionStart);
+                        int endIdx = std::max(g_resultCursorPos, g_resultSelectionStart);
+                        CopyToClipboard(hWnd, cleanForClipboard(ActiveResult().substr(startIdx, endIdx - startIdx)));
+                    }
+                }
+                else {
+                    if (g_cursorPos != g_selectionStart) {
+                        int startIdx = std::min(g_cursorPos, g_selectionStart);
+                        int endIdx = std::max(g_cursorPos, g_selectionStart);
+                        CopyToClipboard(hWnd, ActiveText().substr(startIdx, endIdx - startIdx));
+                        DeleteSelection();
+                    }
+                }
             }
             break;
 
@@ -2080,28 +2213,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             break;
         }
 
-        g_resultText = CalculateResult(g_inputText);
-        g_pResultTree.reset();
-        g_pLayoutTree.reset();
+        if (ActiveText() != oldText) {
+            ActiveResult() = CalculateResult(ActiveText());
+            ActiveResultTree().reset();
+            ActiveLayoutTree().reset();
+            if (g_selectedIndex >= 0) SaveFormulasToFile();
+            g_resultCursorPos = 0;
+            g_resultSelectionStart = 0;
+        }
+
         g_caretVisible = true;
         InvalidateRect(hWnd, nullptr, FALSE);
     }
     break;
     case WM_CHAR:
     {
-        g_selectedIndex = -1;
         wchar_t ch = static_cast<wchar_t>(wParam);
         if (ch >= 32) {
+            std::wstring oldText = ActiveText();
+            if (g_isResultFocused) {
+                g_isResultFocused = false;
+                g_cursorPos = static_cast<int>(ActiveText().length());
+                g_selectionStart = g_cursorPos;
+            }
             if (g_cursorPos != g_selectionStart) {
                 DeleteSelection();
             }
+            std::wstring& actText = ActiveText();
             bool shouldAutoCompleteFraction = false;
             if (ch == L'/') {
                 if (g_cursorPos == 0) {
                     shouldAutoCompleteFraction = true;
                 }
                 else {
-                    wchar_t prevChar = g_inputText[g_cursorPos - 1];
+                    wchar_t prevChar = actText[g_cursorPos - 1];
                     if (prevChar == L'(' || prevChar == L'^' || prevChar == L'/' ||
                         prevChar == L'+' || prevChar == L'-' || prevChar == L'=' ||
                         prevChar == L' ') {
@@ -2110,17 +2255,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 }
             }
             if (shouldAutoCompleteFraction) {
-                g_inputText.insert(g_cursorPos, L"1/");
+                actText.insert(g_cursorPos, L"1/");
                 g_cursorPos += 2;
             }
             else {
-                g_inputText.insert(g_cursorPos, 1, ch);
+                actText.insert(g_cursorPos, 1, ch);
                 g_cursorPos++;
             }
             g_selectionStart = g_cursorPos;
-            g_resultText = CalculateResult(g_inputText);
-            g_pResultTree.reset();
-            g_pLayoutTree.reset();
+
+            if (actText != oldText) {
+                ActiveResult() = CalculateResult(actText);
+                ActiveResultTree().reset();
+                ActiveLayoutTree().reset();
+                if (g_selectedIndex >= 0) SaveFormulasToFile();
+                g_resultCursorPos = 0;
+                g_resultSelectionStart = 0;
+            }
+
             g_caretVisible = true;
             InvalidateRect(hWnd, nullptr, FALSE);
         }
@@ -2143,192 +2295,252 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         D2D1_COLOR_F textColor = g_isDarkMode ? D2D1::ColorF(0xD4D4D4) : D2D1::ColorF(D2D1::ColorF::Black);
         ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
 
+        float dummyW, minAscent, minDescent;
+        ctx.MeasureGlyph(L"0", 36.0f, false, dummyW, minAscent, minDescent);
+
+        auto populateMetrics = [&](std::shared_ptr<Box> tree, const std::wstring& text, float screenX, float screenY, float scale, std::vector<CaretMetrics>& outMetrics) {
+            int len = static_cast<int>(text.length());
+            outMetrics.assign(len + 1, CaretMetrics());
+            if (!tree) return;
+            tree->MapCaret(&ctx, 0.0f, 0.0f, 1.0f, false, outMetrics);
+
+            if (outMetrics[0].x < 0.0f) {
+                outMetrics[0].x = 0.0f; outMetrics[0].y = 0.0f;
+                outMetrics[0].scale = 1.0f; outMetrics[0].isActive = false;
+            }
+            for (int j = 1; j <= len; j++) {
+                if (outMetrics[j].x < 0.0f) {
+                    outMetrics[j].x = outMetrics[j - 1].x; outMetrics[j].y = outMetrics[j - 1].y;
+                    outMetrics[j].scale = outMetrics[j - 1].scale; outMetrics[j].isActive = outMetrics[j - 1].isActive;
+                }
+            }
+            for (int j = len - 1; j >= 0; j--) {
+                if (outMetrics[j].x < 0.0f) {
+                    outMetrics[j].x = outMetrics[j + 1].x; outMetrics[j].y = outMetrics[j + 1].y;
+                    outMetrics[j].scale = outMetrics[j + 1].scale; outMetrics[j].isActive = outMetrics[j + 1].isActive;
+                }
+            }
+            for (auto& m : outMetrics) {
+                m.x = screenX + m.x * scale;
+                m.y = screenY + m.y * scale;
+                m.scale *= scale;
+            }
+            };
+
+        auto drawHighlightAndCaret = [&](const std::vector<CaretMetrics>& metrics, int curPos, int selStart, bool hasFocus) {
+            if (metrics.empty()) return;
+            int len = static_cast<int>(metrics.size()) - 1;
+
+            float baseTop = -minAscent;
+            float baseBottom = minDescent;
+
+            if (curPos != selStart) {
+                int startIdx = std::max(0, std::min(curPos, selStart));
+                int endIdx = std::max(0, std::min(std::max(curPos, selStart), len));
+
+                ComPtr<ID2D1SolidColorBrush> highlightBrush;
+                D2D1_COLOR_F selColor = g_isDarkMode ? D2D1::ColorF(0.15f, 0.35f, 0.6f, 0.6f) : D2D1::ColorF(0.0f, 0.4f, 1.0f, 0.2f);
+                if (!hasFocus) selColor.a *= 0.5f;
+                g_pRenderTarget->CreateSolidColorBrush(selColor, &highlightBrush);
+
+                float currentLeftX = -10000.0f;
+                float currentRightX = -10000.0f;
+                float currentY = -10000.0f;
+                float currentScale = -1.0f;
+
+                auto drawCurrentRect = [&]() {
+                    if (currentLeftX != -10000.0f && currentRightX > currentLeftX) {
+                        float cTop = currentY + (baseTop * currentScale);
+                        float cBot = currentY + (baseBottom * currentScale);
+                        D2D1_RECT_F rect = D2D1::RectF(currentLeftX, cTop, currentRightX, cBot);
+                        g_pRenderTarget->FillRectangle(&rect, highlightBrush.Get());
+                    }
+                    };
+
+                for (int k = startIdx; k < endIdx; ++k) {
+                    float x1 = metrics[k].x;
+                    float y1 = metrics[k].y;
+                    float scale1 = metrics[k].scale;
+                    float x2 = metrics[k + 1].x;
+                    float y2 = metrics[k + 1].y;
+                    float scale2 = metrics[k + 1].scale;
+
+                    if (std::abs(x1 - x2) > 0.01f) {
+                        float segLeft = std::min(x1, x2);
+                        float segRight = std::max(x1, x2);
+                        if (currentY != -10000.0f && std::abs(currentY - y1) < 1.0f && std::abs(currentScale - scale1) < 0.01f) {
+                            currentLeftX = std::min(currentLeftX, segLeft);
+                            currentRightX = std::max(currentRightX, segRight);
+                        }
+                        else {
+                            drawCurrentRect();
+                            currentLeftX = segLeft;
+                            currentRightX = segRight;
+                            currentY = y1;
+                            currentScale = scale1;
+                        }
+                    }
+                }
+                drawCurrentRect();
+            }
+
+            if (hasFocus && g_caretVisible && curPos >= 0 && curPos <= len) {
+                float caretX = metrics[curPos].x;
+                float cscale = metrics[curPos].scale;
+                float cy = metrics[curPos].y;
+                float caretTop = cy + (baseTop * cscale);
+                float caretBottom = cy + (baseBottom * cscale);
+                ctx.DrawLine(caretX + 2.0f, caretTop, caretX + 2.0f, caretBottom, 2.0f);
+            }
+            };
+
         if (!g_pLayoutTree) g_pLayoutTree = ParseMathText(g_inputText, &ctx);
 
-        g_inputScale = 1.0f;
-        g_inputStartY = INPUT_AREA_HEIGHT / 2.0f;
-        float treeTotalHeight = g_pLayoutTree->height + g_pLayoutTree->depth;
+        float eqW, eqH, eqD;
+        ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
 
-        if (treeTotalHeight > (INPUT_AREA_HEIGHT - 20.0f)) {
-            g_inputScale = (INPUT_AREA_HEIGHT - 20.0f) / treeTotalHeight;
-        }
+        float baseAscent = std::max(minAscent, eqH);
+        float baseDescent = std::max(minDescent, eqD);
 
-        float scaledHeight = g_pLayoutTree->height * g_inputScale;
-        float scaledDepth = g_pLayoutTree->depth * g_inputScale;
-
-        if (g_inputStartY - scaledHeight < 10.0f) {
-            g_inputStartY = 10.0f + scaledHeight;
-        }
-        else if (g_inputStartY + scaledDepth > INPUT_AREA_HEIGHT - 10.0f) {
-            g_inputStartY = INPUT_AREA_HEIGHT - 10.0f - scaledDepth;
-        }
+        float maxAscentMain = std::max(g_pLayoutTree->height, baseAscent);
+        float maxDescentMain = std::max(g_pLayoutTree->depth, baseDescent);
 
         float startX = 50.0f;
-        float startY = g_inputStartY;
+        float gap = 20.0f;
+        float resultX = startX + g_pLayoutTree->width + gap;
 
-        int len = static_cast<int>(g_inputText.length());
-        std::vector<CaretMetrics> metrics(len + 1);
-        g_pLayoutTree->MapCaret(&ctx, 0.0f, 0.0f, 1.0f, false, metrics);
-        if (metrics[0].x < 0.0f) {
-            metrics[0].x = 0.0f; metrics[0].y = 0.0f;
-            metrics[0].scale = 1.0f; metrics[0].isActive = false;
+        std::wstring cleanInput = g_inputText;
+        cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L'\x200B'), cleanInput.end());
+        cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L' '), cleanInput.end());
+        bool hasEquals = false;
+        if (cleanInput != L"version" && g_resultText != L"is\x00A0prime" && !g_resultText.empty()) {
+            hasEquals = true;
+            resultX += eqW + gap;
         }
-        for (int i = 1; i <= len; i++) {
-            if (metrics[i].x < 0.0f) {
-                metrics[i].x = metrics[i - 1].x; metrics[i].y = metrics[i - 1].y;
-                metrics[i].scale = metrics[i - 1].scale; metrics[i].isActive = metrics[i - 1].isActive;
-            }
-        }
-        for (int i = len - 1; i >= 0; i--) {
-            if (metrics[i].x < 0.0f) {
-                metrics[i].x = metrics[i + 1].x; metrics[i].y = metrics[i + 1].y;
-                metrics[i].scale = metrics[i + 1].scale; metrics[i].isActive = metrics[i + 1].isActive;
-            }
-        }
-
-        for (auto& m : metrics) {
-            m.x *= g_inputScale;
-            m.y *= g_inputScale;
-            m.scale *= g_inputScale;
-        }
-        g_caretMetrics = metrics;
-
-        if (g_cursorPos != g_selectionStart) {
-            int startIdx = std::min(g_cursorPos, g_selectionStart);
-            int endIdx = std::max(g_cursorPos, g_selectionStart);
-            ComPtr<ID2D1SolidColorBrush> highlightBrush;
-            D2D1_COLOR_F selColor = g_isDarkMode ? D2D1::ColorF(0.15f, 0.35f, 0.6f, 0.6f) : D2D1::ColorF(0.0f, 0.4f, 1.0f, 0.2f);
-            g_pRenderTarget->CreateSolidColorBrush(selColor, &highlightBrush);
-            float currentLeftX = -10000.0f;
-            float currentRightX = -10000.0f;
-            float currentY = -10000.0f;
-            float currentScale = -1.0f;
-            auto drawCurrentRect = [&]() {
-                if (currentLeftX != -10000.0f && currentRightX > currentLeftX) {
-                    float baseTop = -30.0f;
-                    float baseBottom = 12.0f;
-                    float cTop = startY + currentY + (baseTop * currentScale);
-                    float cBot = startY + currentY + (baseBottom * currentScale);
-                    D2D1_RECT_F rect = D2D1::RectF(currentLeftX, cTop, currentRightX, cBot);
-                    g_pRenderTarget->FillRectangle(&rect, highlightBrush.Get());
-                }
-                };
-            for (int k = startIdx; k < endIdx; ++k) {
-                float x1 = startX + g_caretMetrics[k].x;
-                float y1 = g_caretMetrics[k].y;
-                float scale1 = g_caretMetrics[k].scale;
-                float x2 = startX + g_caretMetrics[k + 1].x;
-                float y2 = g_caretMetrics[k + 1].y;
-                float scale2 = g_caretMetrics[k + 1].scale;
-                y1 = y2;
-                scale1 = scale2;
-                if (std::abs(x1 - x2) > 0.01f) {
-                    float segLeft = std::min(x1, x2);
-                    float segRight = std::max(x1, x2);
-
-                    if (currentY != -10000.0f && std::abs(currentY - y1) < 1.0f && std::abs(currentScale - scale1) < 0.01f) {
-                        currentLeftX = std::min(currentLeftX, segLeft);
-                        currentRightX = std::max(currentRightX, segRight);
-                    }
-                    else {
-                        drawCurrentRect();
-                        currentLeftX = segLeft;
-                        currentRightX = segRight;
-                        currentY = y1;
-                        currentScale = scale1;
-                    }
-                }
-            }
-            drawCurrentRect();
-        }
-
-        D2D1_MATRIX_3X2_F oldTr;
-        g_pRenderTarget->GetTransform(&oldTr);
-        g_pRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(g_inputScale, g_inputScale, D2D1::Point2F(startX, startY)) * oldTr);
-
-        g_pLayoutTree->Draw(&ctx, startX, startY);
 
         RECT rc;
         GetClientRect(hWnd, &rc);
 
-        if (!g_resultText.empty()) {
-            if (g_isDarkMode) {
-                ctx.SetTextColor(0.5f, 0.5f, 0.5f);
-            }
-            else {
-                ctx.SetTextColor(0.6f, 0.6f, 0.6f);
-            }
-            float gap = 20.0f;
-            float resultX = startX + g_pLayoutTree->width + gap;
-            std::wstring cleanInput = g_inputText;
-            cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L'\x200B'), cleanInput.end());
-            cleanInput.erase(std::remove(cleanInput.begin(), cleanInput.end(), L' '), cleanInput.end());
-            if (cleanInput != L"version" && g_resultText != L"is\x00A0prime") {
-                float eqW, eqH, eqD;
-                ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
-                ctx.DrawGlyph(L"=", resultX, startY, 36.0f, false);
-                resultX += eqW + gap;
-            }
+        g_inputScale = 1.0f;
+        float screenResX = startX + (resultX - startX) * g_inputScale;
 
-            float btnWidth = 50.0f;
-            float screenResultX = startX + (resultX - startX) * g_inputScale;
-            float maxResultWidthScreen = rc.right - screenResultX - btnWidth - 40.0f;
-            float maxResultWidth = maxResultWidthScreen / g_inputScale;
+        if (g_selectedIndex == -1) {
+            if (!g_resultText.empty()) {
+                float btnWidth = 36.0f;
+                float maxResultWidthScreen = rc.right - screenResX - btnWidth - 40.0f;
+                float maxResultWidth = maxResultWidthScreen / g_inputScale;
 
-            if (!g_pResultTree) {
-                g_pResultTree = ParseMathText(g_resultText, &ctx);
-                if (g_pResultTree->width > maxResultWidth) {
-                    if (maxResultWidth <= 40.0f) {
-                        g_pResultTree = ParseMathText(L"...", &ctx);
-                    }
-                    else {
-                        std::wstring tempText = g_resultText;
-                        while (tempText.length() > 0) {
-                            tempText.pop_back();
-                            if (!tempText.empty() && tempText.back() == L'\x02') {
+                if (!g_pResultTree) {
+                    g_pResultTree = ParseMathText(g_resultText, &ctx);
+                    if (g_pResultTree->width > maxResultWidth) {
+                        if (maxResultWidth <= 40.0f) {
+                            g_pResultTree = ParseMathText(L"...", &ctx);
+                        }
+                        else {
+                            std::wstring tempText = g_resultText;
+                            while (tempText.length() > 0) {
                                 tempText.pop_back();
-                            }
-                            auto tempTree = ParseMathText(tempText + L"...", &ctx);
-                            if (tempTree->width <= maxResultWidth || tempText.empty()) {
-                                g_pResultTree = tempTree;
-                                break;
+                                if (!tempText.empty() && tempText.back() == L'\x02') tempText.pop_back();
+                                auto tempTree = ParseMathText(tempText + L"...", &ctx);
+                                if (tempTree->width <= maxResultWidth || tempText.empty()) {
+                                    g_pResultTree = tempTree;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                maxAscentMain = std::max(maxAscentMain, g_pResultTree->height);
+                maxDescentMain = std::max(maxDescentMain, g_pResultTree->depth);
             }
-            g_pResultTree->Draw(&ctx, resultX, startY);
+
+            float treeTotalHeight = maxAscentMain + maxDescentMain;
+            if (treeTotalHeight > (INPUT_AREA_HEIGHT - 20.0f)) {
+                g_inputScale = (INPUT_AREA_HEIGHT - 20.0f) / treeTotalHeight;
+            }
+
+            g_inputStartY = (INPUT_AREA_HEIGHT / 2.0f) + (maxAscentMain - maxDescentMain) * g_inputScale / 2.0f;
+            float startY = g_inputStartY;
+            screenResX = startX + (resultX - startX) * g_inputScale;
+
+            populateMetrics(g_pLayoutTree, g_inputText, startX, startY, g_inputScale, g_caretMetrics);
+            if (g_pResultTree && !g_resultText.empty()) {
+                populateMetrics(g_pResultTree, g_resultText, screenResX, startY, g_inputScale, g_resultCaretMetrics);
+            }
+            else {
+                g_resultCaretMetrics.clear();
+            }
+
+            drawHighlightAndCaret(g_caretMetrics, g_cursorPos, g_selectionStart, !g_isResultFocused);
+            drawHighlightAndCaret(g_resultCaretMetrics, g_resultCursorPos, g_resultSelectionStart, g_isResultFocused);
+        }
+        else {
+            float treeTotalHeight = maxAscentMain + maxDescentMain;
+            if (treeTotalHeight > (INPUT_AREA_HEIGHT - 20.0f)) {
+                g_inputScale = (INPUT_AREA_HEIGHT - 20.0f) / treeTotalHeight;
+            }
+            g_inputStartY = (INPUT_AREA_HEIGHT / 2.0f) + (maxAscentMain - maxDescentMain) * g_inputScale / 2.0f;
+        }
+
+        D2D1_MATRIX_3X2_F oldTr;
+        g_pRenderTarget->GetTransform(&oldTr);
+        g_pRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(g_inputScale, g_inputScale, D2D1::Point2F(startX, g_inputStartY)) * oldTr);
+
+        g_pLayoutTree->Draw(&ctx, startX, g_inputStartY);
+
+        if (!g_resultText.empty()) {
+            if (g_isDarkMode) ctx.SetTextColor(0.5f, 0.5f, 0.5f);
+            else ctx.SetTextColor(0.6f, 0.6f, 0.6f);
+
+            if (hasEquals) {
+                ctx.DrawGlyph(L"=", resultX - eqW - gap, g_inputStartY, 36.0f, false);
+            }
+            if (g_pResultTree) g_pResultTree->Draw(&ctx, resultX, g_inputStartY);
         }
 
         g_pRenderTarget->SetTransform(oldTr);
         ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
 
-        if (!g_resultText.empty()) {
-            float btnWidth = 50.0f;
-            float btnHeight = 26.0f;
-            g_pinButtonRect = D2D1::RectF(rc.right - btnWidth - 25.0f, startY - btnHeight / 2.0f, rc.right - 25.0f, startY + btnHeight / 2.0f);
+        if (g_selectedIndex == -1 && !g_resultText.empty()) {
+            std::wstring pinIconChar = L"\xE718";
+            float iconFontSize = 20.0f;
+
+            float iconW, iconH, iconD;
+            ctx.MeasureIcon(pinIconChar, iconFontSize, iconW, iconH, iconD);
+
+            float eqCenterOffset = (eqH - eqD) / 2.0f;
+            float eqCenterY = g_inputStartY - eqCenterOffset * g_inputScale;
+
+            float iconCenterOffset = (iconH - iconD) / 2.0f;
+            float pinDrawBaseY = eqCenterY + iconCenterOffset;
+
+            float btnPaddingHorizontal = 6.0f;
+            float btnPaddingVertical = 4.0f;
+            float btnWidth = iconW + btnPaddingHorizontal * 2.0f;
+            float btnHeight = iconH + iconD + btnPaddingVertical * 2.0f;
+
+            g_pinButtonRect = D2D1::RectF(
+                (float)rc.right - btnWidth - 25.0f,
+                eqCenterY - btnHeight / 2.0f,
+                (float)rc.right - 25.0f,
+                eqCenterY + btnHeight / 2.0f
+            );
+
             ComPtr<ID2D1SolidColorBrush> btnBrush;
             g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0x444444) : D2D1::ColorF(0xE0E0E0), &btnBrush);
             D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(g_pinButtonRect, 4.0f, 4.0f);
             g_pRenderTarget->FillRoundedRectangle(&rr, btnBrush.Get());
 
-            ComPtr<ID2D1SolidColorBrush> btnTextBrush;
-            g_pRenderTarget->CreateSolidColorBrush(g_isDarkMode ? D2D1::ColorF(0xFFFFFF) : D2D1::ColorF(0x000000), &btnTextBrush);
-            g_pRenderTarget->DrawTextW(L"PIN", 3, g_pUiTextFormat.Get(), g_pinButtonRect, btnTextBrush.Get());
+            D2D1_COLOR_F currentTextColor = g_isDarkMode ? D2D1::ColorF(0xD4D4D4) : D2D1::ColorF(D2D1::ColorF::Black);
+            ctx.SetTextColor(currentTextColor.r, currentTextColor.g, currentTextColor.b);
+
+            float pinDrawX = g_pinButtonRect.left + btnPaddingHorizontal;
+            ctx.DrawIcon(pinIconChar, pinDrawX, pinDrawBaseY, iconFontSize);
+
+            ctx.SetTextColor(textColor.r, textColor.g, textColor.b, textColor.a);
         }
         else {
             g_pinButtonRect = { 0,0,0,0 };
-        }
-
-        if (g_caretVisible) {
-            float caretX = startX + g_caretMetrics[g_cursorPos].x;
-            float scale = g_caretMetrics[g_cursorPos].scale;
-            float yOffset = g_caretMetrics[g_cursorPos].y;
-            float baseTop = -26.0f;
-            float baseBottom = 8.0f;
-            float caretTop = startY + yOffset + (baseTop * scale);
-            float caretBottom = startY + yOffset + (baseBottom * scale);
-            ctx.DrawLine(caretX + 2.0f, caretTop, caretX + 2.0f, caretBottom, 2.0f);
         }
 
         ctx.SetTextColor(0.5f, 0.5f, 0.5f, 0.3f);
@@ -2354,45 +2566,89 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 continue;
             }
 
-            if (i == g_selectedIndex) {
-                ComPtr<ID2D1SolidColorBrush> highlightBrush;
-                g_pRenderTarget->CreateSolidColorBrush(
-                    g_isDarkMode ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.05f) : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.05f),
-                    &highlightBrush
-                );
-                D2D1_RECT_F rowRect = D2D1::RectF(0, listY - LIST_ITEM_HEIGHT / 2.0f, (float)rc.right, listY + LIST_ITEM_HEIGHT / 2.0f);
-                g_pRenderTarget->FillRectangle(rowRect, highlightBrush.Get());
-            }
-
             if (!sf.pFormulaTree) sf.pFormulaTree = ParseMathText(sf.formula, &ctx);
-            if (!sf.pResultTree) sf.pResultTree = ParseMathText(sf.result, &ctx);
 
-            float itemScale = 1.0f;
+            float itemScaleForDraw = 1.0f;
             float maxItemHeight = LIST_ITEM_HEIGHT - 20.0f;
-            float treeH = sf.pFormulaTree->height + sf.pFormulaTree->depth;
-            float resH = sf.pResultTree->height + sf.pResultTree->depth;
-            float maxH = std::max(treeH, resH);
 
-            if (maxH > maxItemHeight) {
-                itemScale = maxItemHeight / maxH;
-            }
+            float maxListAscent = std::max(sf.pFormulaTree->height, baseAscent);
+            float maxListDescent = std::max(sf.pFormulaTree->depth, baseDescent);
 
             float itemStartX = 40.0f;
+            bool hasEq = (sf.formula != L"version" && sf.result != L"is\x00A0prime");
+            float listResX = itemStartX + sf.pFormulaTree->width + gap;
+            if (hasEq) listResX += eqW + gap;
+
+            if (!sf.pResultTree) {
+                sf.pResultTree = ParseMathText(sf.result, &ctx);
+
+                float tempMaxAscent = maxListAscent;
+                float tempMaxDescent = maxListDescent;
+                if (sf.pResultTree) {
+                    tempMaxAscent = std::max(tempMaxAscent, sf.pResultTree->height);
+                    tempMaxDescent = std::max(tempMaxDescent, sf.pResultTree->depth);
+                }
+
+                float tempMaxH = tempMaxAscent + tempMaxDescent;
+                float tempScale = 1.0f;
+                if (tempMaxH > maxItemHeight) tempScale = maxItemHeight / tempMaxH;
+
+                float sfScreenResX = itemStartX + (listResX - itemStartX) * tempScale;
+                float maxResultWidthScreen = rc.right - sfScreenResX - 75.0f;
+                float maxResultWidth = maxResultWidthScreen / tempScale;
+
+                if (sf.pResultTree->width > maxResultWidth) {
+                    if (maxResultWidth <= 40.0f) {
+                        sf.pResultTree = ParseMathText(L"...", &ctx);
+                    }
+                    else {
+                        std::wstring tempText = sf.result;
+                        while (tempText.length() > 0) {
+                            tempText.pop_back();
+                            if (!tempText.empty() && tempText.back() == L'\x02') tempText.pop_back();
+                            auto tempTree = ParseMathText(tempText + L"...", &ctx);
+                            if (tempTree->width <= maxResultWidth || tempText.empty()) {
+                                sf.pResultTree = tempTree;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (sf.pResultTree) {
+                maxListAscent = std::max(maxListAscent, sf.pResultTree->height);
+                maxListDescent = std::max(maxListDescent, sf.pResultTree->depth);
+            }
+
+            float maxH = maxListAscent + maxListDescent;
+            if (maxH > maxItemHeight) {
+                itemScaleForDraw = maxItemHeight / maxH;
+            }
+
+            float baselineY = listY + (maxListAscent - maxListDescent) * itemScaleForDraw / 2.0f;
+
+            if (i == g_selectedIndex) {
+                populateMetrics(sf.pFormulaTree, sf.formula, itemStartX, baselineY, itemScaleForDraw, g_caretMetrics);
+                if (sf.pResultTree && !sf.result.empty()) {
+                    float sfScreenResX = itemStartX + (listResX - itemStartX) * itemScaleForDraw;
+                    populateMetrics(sf.pResultTree, sf.result, sfScreenResX, baselineY, itemScaleForDraw, g_resultCaretMetrics);
+                }
+                else {
+                    g_resultCaretMetrics.clear();
+                }
+
+                drawHighlightAndCaret(g_caretMetrics, g_cursorPos, g_selectionStart, !g_isResultFocused);
+                drawHighlightAndCaret(g_resultCaretMetrics, g_resultCursorPos, g_resultSelectionStart, g_isResultFocused);
+            }
 
             D2D1_MATRIX_3X2_F oldListTr;
             g_pRenderTarget->GetTransform(&oldListTr);
-            g_pRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(itemScale, itemScale, D2D1::Point2F(itemStartX, listY)) * oldListTr);
+            g_pRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(itemScaleForDraw, itemScaleForDraw, D2D1::Point2F(itemStartX, baselineY)) * oldListTr);
 
-            sf.pFormulaTree->Draw(&ctx, itemStartX, listY);
-
-            float gap = 20.0f;
-            float resX = itemStartX + sf.pFormulaTree->width + gap;
-            float eqW, eqH, eqD;
-            ctx.MeasureGlyph(L"=", 36.0f, false, eqW, eqH, eqD);
-            ctx.DrawGlyph(L"=", resX, listY, 36.0f, false);
-            resX += eqW + gap;
-
-            sf.pResultTree->Draw(&ctx, resX, listY);
+            sf.pFormulaTree->Draw(&ctx, itemStartX, baselineY);
+            if (hasEq) ctx.DrawGlyph(L"=", itemStartX + sf.pFormulaTree->width + gap, baselineY, 36.0f, false);
+            sf.pResultTree->Draw(&ctx, listResX, baselineY);
 
             g_pRenderTarget->SetTransform(oldListTr);
 
@@ -2446,6 +2702,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pRenderTarget->Resize(D2D1::SizeU(width, height));
         }
         g_pResultTree.reset();
+        for (auto& sf : g_savedFormulas) {
+            sf.pResultTree.reset();
+        }
         InvalidateRect(hWnd, nullptr, FALSE);
     }
     break;
